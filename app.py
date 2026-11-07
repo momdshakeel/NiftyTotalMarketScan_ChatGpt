@@ -148,8 +148,44 @@ def show(frame: pd.DataFrame, name: str, note: str):
                        key=f"dl_{name}")
 
 
-tab1, tab2, tab3, tab4 = st.tabs([f"Top picks ({len(top)})", f"Trend Template pass ({len(tt)})",
-                                  f"RS blue dot ({len(blue)})", f"All stocks ({len(df)})"])
+IND_CFG = {
+    "Rank": st.column_config.NumberColumn("Rank", format="%d"),
+    "Industry_Score": st.column_config.ProgressColumn("Strength (1-99)", min_value=0, max_value=99, format="%d"),
+    "Stocks": st.column_config.NumberColumn("Stocks", format="%d"),
+    "Median_RS": st.column_config.NumberColumn("Median RS", format="%.0f"),
+    "Avg_RS": st.column_config.NumberColumn("Avg RS", format="%.1f"),
+    "Avg_RS_Change": st.column_config.NumberColumn("Avg RS chg", format="%.1f"),
+    "Pct_RS80": st.column_config.NumberColumn("% stocks RS>=80", format="%.0f"),
+    "Pct_TT_Pass": st.column_config.NumberColumn("% pass Trend Template", format="%.0f"),
+    "TT_Pass_Count": st.column_config.NumberColumn("TT pass #", format="%d"),
+    "Blue_Dots": st.column_config.NumberColumn("Blue dots", format="%d"),
+    "Avg_Weighted_Return_%": st.column_config.NumberColumn("Avg weighted return %", format="%.1f"),
+    "Top_Stocks": st.column_config.TextColumn("Top 3 stocks (by RS)"),
+}
+
+
+def show_industries():
+    st.caption("Industries ranked by a blend of median RS Rating (50%), share of stocks with RS >= 80 (25%) "
+               "and share passing the Trend Template (25%). Uses the whole NSE 500 (sidebar filters don't apply).")
+    min_n = st.slider("Minimum stocks per industry", 1, 10, 3,
+                      help="Small industries give noisy scores, so they are hidden below this size.")
+    ind = m.industry_strength(result, min_stocks=min_n)
+    if ind.empty:
+        st.info("No industries meet the minimum size.")
+        return
+    st.dataframe(ind, hide_index=True, column_config=IND_CFG, height=520)
+    st.download_button("⬇️ Download CSV", ind.to_csv(index=False).encode("utf-8"),
+                       file_name=f"nse500_industry_strength_{as_of.date()}.csv", mime="text/csv",
+                       key="dl_industry_table")
+    st.subheader("Stocks in an industry")
+    pick = st.selectbox("Choose an industry (listed by strength)", ind["Industry"].tolist())
+    members = result[result["Industry"] == pick].sort_values("RS_Rating", ascending=False)
+    show(members, "industry_stocks", f"All rated stocks in {pick}, sorted by RS Rating.")
+
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    f"Top picks ({len(top)})", f"Trend Template pass ({len(tt)})", f"RS blue dot ({len(blue)})",
+    "Industry strength", f"All stocks ({len(df)})"])
 with tab1:
     show(top, "top_picks", f"Passes all 8 Trend Template conditions, RS >= {pref_rs}, "
                            f"RS line within 5% of its 52-week high, RSI > {rsi_min}.")
@@ -160,6 +196,8 @@ with tab3:
     show(blue, "blue_dot", f"RS line at a 52-week high while price is still >2% below its own high "
                            f"(RS >= {pref_rs}).")
 with tab4:
+    show_industries()
+with tab5:
     show(df.sort_values("RS_Rating", ascending=False), "all", "Every rated stock, sorted by RS Rating. "
                                                              "Click any column header to re-sort.")
 
