@@ -230,6 +230,44 @@ def build_table(prices, bench, meta):
                .reset_index(drop=True), end_date)
 
 
+def industry_strength(result, min_stocks=3):
+    """Rank industries by how strong their stocks are.
+    Industry score (1-99) = percentile rank of a blend of:
+      50% median RS Rating, 25% share of stocks with RS >= 80,
+      25% share of stocks passing the Trend Template.
+    Industries with fewer than `min_stocks` rated stocks are skipped (too noisy)."""
+    r = result.dropna(subset=["Industry"]).assign(_leader=lambda d: d["RS_Rating"] >= 80)
+    g = r.groupby("Industry")
+    leaders = (r.sort_values("RS_Rating", ascending=False)
+                .groupby("Industry")["Symbol"].apply(lambda s: ", ".join(s.head(3))))
+    out = pd.DataFrame({
+        "Stocks": g.size(),
+        "Median_RS": g["RS_Rating"].median(),
+        "Avg_RS": g["RS_Rating"].mean(),
+        "Avg_RS_Change": g["RS_Change"].mean(),
+        "Pct_RS80": g["_leader"].mean() * 100,
+        "Pct_TT_Pass": g["TT_Pass"].mean() * 100,
+        "TT_Pass_Count": g["TT_Pass"].sum(),
+        "Blue_Dots": g["RS_Blue_Dot"].sum(),
+        "Avg_Weighted_Return_%": g["Weighted_Return_%"].mean(),
+        "Top_Stocks": leaders,
+    })
+    out = out[out["Stocks"] >= min_stocks]
+    if out.empty:
+        return out.reset_index()
+    pr = lambda x: x.rank(pct=True)
+    blend = 0.5 * pr(out["Median_RS"]) + 0.25 * pr(out["Pct_RS80"]) + 0.25 * pr(out["Pct_TT_Pass"])
+    out.insert(0, "Industry_Score", rs_rating(blend))
+    out = out.sort_values(["Industry_Score", "Median_RS", "Avg_RS"], ascending=False)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    for c in ["Median_RS", "Avg_RS", "Avg_RS_Change", "Avg_Weighted_Return_%"]:
+        out[c] = out[c].round(1)
+    for c in ["Pct_RS80", "Pct_TT_Pass"]:
+        out[c] = out[c].round(0)
+    out[["TT_Pass_Count", "Blue_Dots"]] = out[["TT_Pass_Count", "Blue_Dots"]].astype(int)
+    return out.reset_index()
+
+
 # ---------------- 5. Web dashboard (single self-contained HTML file) ----------------
 DASHBOARD_TEMPLATE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -425,6 +463,12 @@ def main():
     print(top[show].head(40).to_string(index=False))
     print(f"\n=== RS BLUE DOT (RS line at 52w high, price not yet): {len(blue)} ===")
     print(blue[show].head(40).to_string(index=False))
+
+    ind = industry_strength(result)
+    print(f"\n=== INDUSTRY STRENGTH (top 15 of {len(ind)} industries) ===")
+    print(ind[["Rank", "Industry", "Industry_Score", "Stocks", "Median_RS", "Pct_RS80",
+               "Pct_TT_Pass", "Top_Stocks"]].head(15).to_string(index=False))
+    ind.to_csv("nse500_industry_strength.csv", index=False)
 
     result.to_csv("nse500_rs_rating_full.csv", index=False)
     tt.to_csv("nse500_trend_template_pass.csv", index=False)
