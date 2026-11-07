@@ -50,9 +50,10 @@ def fetch_universe():
 
 @st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
 def compute(meta: pd.DataFrame):
-    prices = m.download_prices(meta["Ticker"].tolist())
+    md = m.download_market_data(meta["Ticker"].tolist())
+    prices = md["Close"]
     bench = m.get_benchmark()
-    result, as_of = m.build_table(prices, bench, meta)
+    result, as_of = m.build_table(prices, bench, meta, ohlcv=md)
     return result, as_of, datetime.now(IST), prices.shape[1]
 
 
@@ -107,17 +108,42 @@ if q.strip():
 top = df[df.TT_Pass & (df.RS_Rating >= pref_rs) & df.RS_Line_Near_High & (df.RSI14 > rsi_min)]
 tt = df[df.TT_Pass]
 blue = df[df.RS_Blue_Dot & (df.RS_Rating >= pref_rs)]
+vcp = df[df.VCP_Setup].sort_values("Pct_To_Pivot")
+brk = df[df.Vol_Breakout].sort_values(["Breakout_Days_Ago", "Breakout_Vol_x"], ascending=[True, False])
+s1 = df[df.Stage1_Base].sort_values("Base_Days", ascending=False)
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Stocks rated", len(result))
 c2.metric("Top picks", len(top))
-c3.metric("Trend Template pass", len(tt))
+c3.metric("Trend Template", len(tt))
 c4.metric("RS blue dot", len(blue))
+c5.metric("VCP setups", len(vcp))
+c6.metric("Vol breakouts", len(brk))
+c7.metric("Stage 1 bases", len(s1))
 
-COLS = ["Symbol", "Company Name", "Industry", "RS_Rating", "RS_Change", "TT_Score",
+COLS = ["Symbol", "Company Name", "Industry", "RS_Rating", "RS_Change", "Stage", "TT_Score",
         "RS_Line_New_High", "RS_Blue_Dot", "RSI14", "Close", "Pct_From_52W_High",
         "Pct_Above_52W_Low", "Weighted_Return_%", "Chart"]
+PATTERN_COLS = ["Symbol", "Company Name", "Industry", "RS_Rating", "Stage", "TT_Score", "VCP",
+                "VCP_Contractions", "VCP_Vol_Contracting", "Vol_Dry_Up", "VCP_Setup", "Pivot",
+                "Pct_To_Pivot", "Vol_Breakout", "Breakout_Days_Ago", "Breakout_Vol_x", "Vol_x_50d",
+                "Stage1_Base", "Base_Days", "Base_Depth_%", "Close", "Chart"]
 CFG = {
+    "Stage": st.column_config.TextColumn("Stage"),
+    "VCP": st.column_config.CheckboxColumn("VCP"),
+    "VCP_Contractions": st.column_config.TextColumn("Pullbacks % (T1→Tn)"),
+    "VCP_Vol_Contracting": st.column_config.CheckboxColumn("Vol shrinking in VCP"),
+    "Vol_Dry_Up": st.column_config.CheckboxColumn("Vol dry-up"),
+    "VCP_Setup": st.column_config.CheckboxColumn("VCP setup"),
+    "Pivot": st.column_config.NumberColumn("Pivot", format="%.2f"),
+    "Pct_To_Pivot": st.column_config.NumberColumn("% to pivot", format="%.1f"),
+    "Vol_Breakout": st.column_config.CheckboxColumn("Vol breakout"),
+    "Breakout_Days_Ago": st.column_config.NumberColumn("Breakout days ago", format="%d"),
+    "Breakout_Vol_x": st.column_config.NumberColumn("Breakout vol (x avg)", format="%.1f"),
+    "Vol_x_50d": st.column_config.NumberColumn("Today vol (x avg)", format="%.1f"),
+    "Stage1_Base": st.column_config.CheckboxColumn("Stage 1 base"),
+    "Base_Days": st.column_config.NumberColumn("Base length (days)", format="%d"),
+    "Base_Depth_%": st.column_config.NumberColumn("Base depth %", format="%.1f"),
     "Symbol": st.column_config.TextColumn("Symbol"),
     "Company Name": st.column_config.TextColumn("Company"),
     "RS_Rating": st.column_config.ProgressColumn("RS", min_value=0, max_value=99, format="%d"),
@@ -134,15 +160,16 @@ CFG = {
 }
 
 
-def show(frame: pd.DataFrame, name: str, note: str):
+def show(frame: pd.DataFrame, name: str, note: str, cols=None):
     st.caption(note)
     if frame.empty:
         st.info("No stocks match the current filters.")
         return
     view = frame.copy()
     view["Chart"] = "https://www.tradingview.com/chart/?symbol=NSE%3A" + \
-        view["Symbol"].map(lambda s: urllib.parse.quote(s, safe=""))
-    st.dataframe(view[COLS], hide_index=True, column_config=CFG, height=600)
+        view["Symbol"].fillna("").astype(str).map(lambda s: urllib.parse.quote(s, safe=""))
+    cols = [c for c in (cols or COLS) if c in view.columns]
+    st.dataframe(view[cols], hide_index=True, column_config=CFG, height=600)
     st.download_button("⬇️ Download CSV", frame.to_csv(index=False).encode("utf-8"),
                        file_name=f"nse500_{name}_{as_of.date()}.csv", mime="text/csv",
                        key=f"dl_{name}")
@@ -183,21 +210,39 @@ def show_industries():
     show(members, "industry_stocks", f"All rated stocks in {pick}, sorted by RS Rating.")
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    f"Top picks ({len(top)})", f"Trend Template pass ({len(tt)})", f"RS blue dot ({len(blue)})",
+(tab_top, tab_tt, tab_vcp, tab_brk, tab_s1, tab_blue, tab_ind, tab_all) = st.tabs([
+    f"Top picks ({len(top)})", f"Trend Template pass ({len(tt)})", f"VCP setups ({len(vcp)})",
+    f"Volume breakouts ({len(brk)})", f"Stage 1 bases ({len(s1)})", f"RS blue dot ({len(blue)})",
     "Industry strength", f"All stocks ({len(df)})"])
-with tab1:
+with tab_top:
     show(top, "top_picks", f"Passes all 8 Trend Template conditions, RS >= {pref_rs}, "
                            f"RS line within 5% of its 52-week high, RSI > {rsi_min}.")
-with tab2:
+with tab_tt:
     show(tt, "trend_template", "All 8 Minervini conditions met (price vs 50/150/200 SMA, "
                                "200 SMA rising, 30% above 52W low, within 25% of 52W high, RS >= 70).")
-with tab3:
+with tab_vcp:
+    show(vcp, "vcp_setups",
+         "Stage 2 stocks with 2+ successively tighter pullbacks (last one <= 10%), volume dried up over the "
+         f"last 10 days (<= {int(m.VOL_DRYUP_RATIO * 100)}% of the 50-day average) and price 0-{m.VCP_NEAR_PIVOT:.0f}% "
+         "below the pivot (the high before the last pullback). Watch for a close above the pivot on heavy volume. "
+         "Sorted by closeness to the pivot.", PATTERN_COLS)
+with tab_brk:
+    show(brk, "volume_breakouts",
+         f"Closed above the prior {m.BREAKOUT_LOOKBACK}-session high on >= {m.BREAKOUT_VOL_X}x the 50-day average "
+         f"volume, in the last {m.BREAKOUT_RECENT_DAYS} sessions, after a base no deeper than "
+         f"{int(m.MAX_BASE_DEPTH * 100)}%, closing in the upper half of the day's range.", PATTERN_COLS)
+with tab_s1:
+    show(s1, "stage1_bases",
+         "Stage 1 = price around a flat 150-day (30-week) average after a decline, and a sideways base of "
+         f"{m.BASE_WINDOWS[0]}+ sessions is forming (depth <= {int(m.MAX_BASE_DEPTH * 100)}%). These are early "
+         "candidates: they only become buyable when they break out into Stage 2. Sorted by base length.",
+         PATTERN_COLS)
+with tab_blue:
     show(blue, "blue_dot", f"RS line at a 52-week high while price is still >2% below its own high "
                            f"(RS >= {pref_rs}).")
-with tab4:
+with tab_ind:
     show_industries()
-with tab5:
+with tab_all:
     show(df.sort_values("RS_Rating", ascending=False), "all", "Every rated stock, sorted by RS Rating. "
                                                              "Click any column header to re-sort.")
 
@@ -207,5 +252,10 @@ with st.expander("Notes & limitations"):
         "- 52-week high/low use closing prices, not intraday extremes.\n"
         "- RS Rating is relative to the NSE 500 only, so it can differ from screeners that rank a wider universe.\n"
         "- Yahoo Finance data can have gaps; a few tickers may be missing on any given day.\n"
+        "- **Stages** use the 150-day SMA (about the 30-week average): Stage 2 = price above a rising average, "
+        "Stage 4 = below a falling one; Stage 1/3 = flat average after a decline/advance. Stocks with under ~13 "
+        "months of history show 'n/a'.\n"
+        "- **VCP, bases and breakouts are rule-based approximations** computed on daily closes/highs/lows. "
+        "They will flag some patterns a human would reject and miss others, so always confirm on the chart.\n"
         "- Educational tool, not investment advice."
     )
