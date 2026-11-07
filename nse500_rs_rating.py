@@ -17,7 +17,8 @@
 #   8. RS Rating >= 70
 #
 # Output: CSVs + a self-contained web dashboard (nse500_rs_dashboard.html)
-# Extras: RS Line (stock / Nifty 500) new-high flags, RS "blue dot"
+# Extras: Weinstein stage (1-4), base detection, VCP + volume-breakout scans,
+#         RS Line (stock / Nifty 500) new-high flags, RS "blue dot"
 #         (RS line at 52w high before price), RSI(14)
 # ============================================================
 
@@ -27,6 +28,7 @@
 import io
 import json
 import time
+import warnings
 import requests
 import numpy as np
 import pandas as pd
@@ -49,6 +51,31 @@ RS_NEAR_HIGH = 0.95              # RS line within 5% of its 52w high = "near hig
 BLUE_DOT_PRICE_GAP = 0.02        # price still >2% below its own 52w high
 
 NSE500_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+# ---- Stage analysis (Weinstein, 30-week MA ~ 150-day SMA) ----
+STAGE_SLOPE_DAYS = 30            # slope of the 150 SMA measured over 30 sessions (~6 weeks)
+STAGE_PRIOR_DAYS = 80            # ...compared with the 80 sessions before that
+STAGE_FLAT_SLOPE = 0.01          # |slope| <= 1% counts as "flat"
+STAGE4_DIST = 0.20               # price >20% below the 150 SMA is always Stage 4
+
+# ---- Base detection ----
+BASE_WINDOWS = (30, 45, 60, 90, 120, 150)   # sessions checked (6 to 30 weeks)
+MAX_BASE_DEPTH = 0.35            # base depth (high-to-low) at most 35%
+MAX_BASE_DRIFT = 0.15            # price today within +/-15% of price at base start (sideways)
+
+# ---- VCP ----
+VCP_LOOKBACK = 200               # sessions searched for the left peak of the pattern
+ZIGZAG_PCT = 0.04                # a pullback/rally must be >= 4% to count as a swing
+MIN_CONTRACTIONS = 2             # at least 2 successively tighter pullbacks
+TIGHTEN_RATIO = 0.90             # each pullback <= 90% of the previous one
+VCP_LAST_MAX = 0.10              # final contraction no deeper than 10%
+VOL_DRYUP_RATIO = 0.80           # last-10-day avg volume <= 80% of the 50-day avg
+VCP_NEAR_PIVOT = 5.0             # "setup" = price 0-5% below the pivot
+
+# ---- Volume breakout ----
+BREAKOUT_LOOKBACK = 60           # must close above the prior 60-session high
+BREAKOUT_VOL_X = 1.5             # volume >= 1.5x the prior 50-day average
+BREAKOUT_RECENT_DAYS = 3         # look back over the last 3 sessions
 
 
 # ---------------- 1. NSE 500 constituents ----------------
@@ -79,28 +106,46 @@ def _clean_index(obj):
     return obj
 
 
-def download_prices(tickers):
-    frames = []
+def download_market_data(tickers):
+    """Download adjusted OHLCV. Returns {"Close","High","Low","Volume"} DataFrames."""
+    fields = ("Close", "High", "Low", "Volume")
+    frames = {k: [] for k in fields}
     for i in range(0, len(tickers), BATCH_SIZE):
         batch = tickers[i:i + BATCH_SIZE]
         print(f"Downloading {i + 1}-{i + len(batch)} of {len(tickers)} ...")
         data = yf.download(batch, period=HISTORY_PERIOD, interval="1d",
                            auto_adjust=True, progress=False, threads=True)
-        close = data["Close"]
-        if isinstance(close, pd.Series):
-            close = close.to_frame(batch[0])
-        frames.append(close)
+        for k in fields:
+            f = data[k]
+            if isinstance(f, pd.Series):
+                f = f.to_frame(batch[0])
+            frames[k].append(f)
         time.sleep(1)
-    prices = pd.concat(frames, axis=1)
-    prices = prices.loc[:, ~prices.columns.duplicated()]
-    prices = _clean_index(prices.sort_index().dropna(axis=1, how="all"))
 
+    panels = {}
+    for k in fields:
+        df = pd.concat(frames[k], axis=1)
+        df = df.loc[:, ~df.columns.duplicated()]
+        panels[k] = _clean_index(df.sort_index())
+
+    close = panels["Close"].dropna(axis=1, how="all")
     # drop stale tickers (delisted / merged / suspended)
-    last_valid = prices.apply(lambda s: s.last_valid_index())
-    stale = last_valid < prices.index[-1] - pd.Timedelta(days=10)
+    last_valid = close.apply(lambda s: s.last_valid_index())
+    stale = last_valid < close.index[-1] - pd.Timedelta(days=10)
     if stale.any():
-        print(f"Dropping {stale.sum()} stale tickers: {list(prices.columns[stale])[:10]}")
-    return prices.loc[:, ~stale].ffill()
+        print(f"Dropping {stale.sum()} stale tickers: {list(close.columns[stale])[:10]}")
+    keep = close.columns[~stale]
+
+    out = {"Close": close[keep].ffill()}
+    for k in ("High", "Low"):
+        out[k] = panels[k].reindex(index=close.index, columns=keep).ffill()
+    out["Volume"] = panels["Volume"].reindex(index=close.index, columns=keep)
+    return out
+
+
+def download_prices(tickers):
+    """Close prices only (kept for backward compatibility)."""
+    return download_market_data(tickers)["Close"]
 
 
 def get_benchmark():
@@ -201,7 +246,183 @@ def technicals(prices, bench, rs_now):
     return pd.concat([out, conds], axis=1)
 
 
-def build_table(prices, bench, meta):
+# ---------------- 4b. Stage, base, VCP and volume-breakout detection ----------------
+STAGE_NAMES = {0: "n/a", 1: "Stage 1 · Basing", 2: "Stage 2 · Advancing",
+               3: "Stage 3 · Topping", 4: "Stage 4 · Declining"}
+
+
+def classify_stage(p):
+    """Weinstein stage from price vs the 150-day SMA (~30-week MA) and its slope.
+    2: price above a rising MA            4: price below a falling MA (or >20% below it)
+    1: otherwise, MA was falling before   3: otherwise, MA was rising before
+    (if the MA was flat before too, the position in the 52-week range decides)."""
+    s150 = p.rolling(150).mean()
+    k = STAGE_SLOPE_DAYS
+    last = p.iloc[-1]
+    m0, mk, mp = s150.iloc[-1], s150.iloc[-1 - k], s150.iloc[-1 - k - STAGE_PRIOR_DAYS]
+    slope, prior = m0 / mk - 1, mk / mp - 1
+    dist = last / m0 - 1
+    flat = STAGE_FLAT_SLOPE
+    win = p.iloc[-252:]
+    pos = (last - win.min()) / (win.max() - win.min())
+
+    s2 = (last > m0) & (slope > flat)
+    s4 = (last < m0) & ((slope < -flat) | (dist < -STAGE4_DIST))
+    amb = ~s2 & ~s4
+    s1 = amb & ((prior < -flat) | ((prior.abs() <= flat) & (pos < 0.5)))
+    s3 = amb & ~s1
+    num = pd.Series(np.select([s2, s4, s1, s3], [2, 4, 1, 3], default=0), index=p.columns)
+    num[m0.isna() | mk.isna() | mp.isna()] = 0
+    return pd.DataFrame({"Stage_Num": num,
+                         "Stage": num.map(STAGE_NAMES),
+                         "SMA150_Slope_%": (slope * 100).round(1)})
+
+
+def detect_base(close, high, low):
+    """Longest recent window (6-30 weeks) that is a sideways consolidation:
+    depth <= MAX_BASE_DEPTH and price within +/-MAX_BASE_DRIFT of where the window began."""
+    cols = close.columns
+    days = pd.Series(0, index=cols)
+    depth = pd.Series(np.nan, index=cols)
+    pivot = pd.Series(np.nan, index=cols)
+    last = close.iloc[-1]
+    for w in BASE_WINDOWS:                       # ascending, so the longest valid window wins
+        hi, lo = high.iloc[-w:].max(), low.iloc[-w:].min()
+        d = (hi - lo) / hi
+        drift = last / close.iloc[-w] - 1
+        ok = (d <= MAX_BASE_DEPTH) & (drift.abs() <= MAX_BASE_DRIFT)
+        days = days.where(~ok, w)
+        depth = depth.where(~ok, d * 100)
+        pivot = pivot.where(~ok, hi)
+    return pd.DataFrame({"Base_Forming": days > 0, "Base_Days": days,
+                         "Base_Depth_%": depth.round(1), "Base_Pivot": pivot})
+
+
+def zigzag(c, pct):
+    """Swing pivots of a price array: list of (index, price, +1 high / -1 low).
+    A swing is confirmed once price reverses by >= pct from the extreme."""
+    piv, direction, hi_i, lo_i = [], 0, 0, 0
+    for i in range(1, len(c)):
+        if direction == 0:
+            if c[i] > c[hi_i]:
+                hi_i = i
+            if c[i] < c[lo_i]:
+                lo_i = i
+            if c[i] <= c[hi_i] * (1 - pct):
+                piv.append((hi_i, c[hi_i], 1)); direction = -1; lo_i = i
+            elif c[i] >= c[lo_i] * (1 + pct):
+                piv.append((lo_i, c[lo_i], -1)); direction = 1; hi_i = i
+        elif direction == 1:
+            if c[i] > c[hi_i]:
+                hi_i = i
+            elif c[i] <= c[hi_i] * (1 - pct):
+                piv.append((hi_i, c[hi_i], 1)); direction = -1; lo_i = i
+        else:
+            if c[i] < c[lo_i]:
+                lo_i = i
+            elif c[i] >= c[lo_i] * (1 + pct):
+                piv.append((lo_i, c[lo_i], -1)); direction = 1; hi_i = i
+    if direction == -1:                          # pullback still in progress: provisional low
+        piv.append((lo_i, c[lo_i], -1))
+    return piv
+
+
+def find_vcp(c, h, v):
+    """VCP shape on one stock. c/h/v = close/high/volume arrays for the last VCP_LOOKBACK sessions.
+    Returns (pullback depths in %, pivot price, volume_contracting) or None."""
+    if len(c) < 40 or np.isnan(c).any() or np.isnan(h).any():
+        return None
+    pk = int(np.argmax(c))                       # left peak of the pattern
+    if len(c) - pk < 20:
+        return None
+    c, h, v = c[pk:], h[pk:], v[pk:]
+    piv = zigzag(c, ZIGZAG_PCT)
+    legs = [(a[0], b[0], (a[1] - b[1]) / a[1])   # (start idx, end idx, depth)
+            for a, b in zip(piv[:-1], piv[1:]) if a[2] == 1 and b[2] == -1]
+    if len(legs) < MIN_CONTRACTIONS:
+        return None
+    run = [legs[-1]]                             # trailing run of successively tighter pullbacks
+    for lg in reversed(legs[:-1]):
+        if run[0][2] <= lg[2] * TIGHTEN_RATIO:
+            run.insert(0, lg)
+        else:
+            break
+    while len(run) > MIN_CONTRACTIONS and run[0][2] > MAX_BASE_DEPTH:
+        run.pop(0)
+    if len(run) < MIN_CONTRACTIONS or run[0][2] > MAX_BASE_DEPTH or run[-1][2] > VCP_LAST_MAX:
+        return None
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        vols = [np.nanmean(v[a:b + 1]) for a, b, _ in run]
+    vol_ok = bool(vols[-1] < vols[0])
+    return [round(d * 100) for *_, d in run], float(h[run[-1][0]]), vol_ok
+
+
+def pattern_table(prices, ohlcv, idx):
+    """Stage, base, VCP and volume-breakout columns for the rated stocks `idx`."""
+    p = prices[idx]
+    high = ohlcv["High"].reindex(index=p.index, columns=idx)
+    low = ohlcv["Low"].reindex(index=p.index, columns=idx)
+    vol = ohlcv["Volume"].reindex(index=p.index, columns=idx)
+    last = p.iloc[-1]
+
+    stage = classify_stage(p)
+    base = detect_base(p, high, low)
+
+    # --- VCP shape, stock by stock ---
+    L = VCP_LOOKBACK
+    C, H, V = (x.iloc[-L:].to_numpy(float) for x in (p, high, vol))
+    vcp_pivot = pd.Series(np.nan, index=idx)
+    vcp_text = pd.Series("", index=idx)
+    vcp_vol_ok = pd.Series(False, index=idx)
+    for j, col in enumerate(idx):
+        r = find_vcp(C[:, j], H[:, j], V[:, j])
+        if r is not None:
+            depths, pv, vok = r
+            vcp_pivot[col], vcp_text[col], vcp_vol_ok[col] = pv, "→".join(map(str, depths)), vok
+
+    pivot = vcp_pivot.fillna(base["Base_Pivot"])
+    pct_to_pivot = ((pivot / last - 1) * 100).round(1)
+    vcp = (vcp_pivot.notna() & (stage["Stage_Num"] == 2)
+           & (pct_to_pivot >= -10) & (pct_to_pivot <= 15))
+
+    # --- volume ---
+    dry = vol.iloc[-10:].mean() / vol.iloc[-50:].mean() <= VOL_DRYUP_RATIO
+    vol_x_today = (vol.iloc[-1] / vol.shift(1).rolling(50).mean().iloc[-1]).round(2)
+    vcp_setup = vcp & dry & (pct_to_pivot >= 0) & (pct_to_pivot <= VCP_NEAR_PIVOT)
+
+    # --- volume breakout in the last few sessions ---
+    prior_hi = high.rolling(BREAKOUT_LOOKBACK).max().shift(1)
+    prior_lo = low.rolling(BREAKOUT_LOOKBACK).min().shift(1)
+    prior_depth = (prior_hi - prior_lo) / prior_hi
+    vr = vol / vol.shift(1).rolling(50).mean()
+    day_range = (high - low).where(lambda x: x > 0)
+    close_pos = (p - low) / day_range
+    brk = (p > prior_hi) & (vr >= BREAKOUT_VOL_X) & (prior_depth <= MAX_BASE_DEPTH) & (close_pos >= 0.5)
+    days_ago = pd.Series(np.nan, index=idx)
+    brk_vol = pd.Series(np.nan, index=idx)
+    for k in range(BREAKOUT_RECENT_DAYS - 1, -1, -1):    # most recent session wins
+        ck = brk.iloc[-1 - k]
+        days_ago = days_ago.where(~ck, k)
+        brk_vol = brk_vol.where(~ck, vr.iloc[-1 - k])
+
+    return pd.DataFrame({
+        "Stage": stage["Stage"], "Stage_Num": stage["Stage_Num"],
+        "SMA150_Slope_%": stage["SMA150_Slope_%"],
+        "Base_Forming": base["Base_Forming"], "Base_Days": base["Base_Days"],
+        "Base_Depth_%": base["Base_Depth_%"],
+        "Stage1_Base": (stage["Stage_Num"] == 1) & base["Base_Forming"],
+        "VCP": vcp, "VCP_Contractions": vcp_text.where(vcp_pivot.notna(), ""),
+        "VCP_Vol_Contracting": vcp & vcp_vol_ok,
+        "Vol_Dry_Up": dry, "VCP_Setup": vcp_setup,
+        "Pivot": pivot.round(2), "Pct_To_Pivot": pct_to_pivot,
+        "Vol_Breakout": days_ago.notna(), "Breakout_Days_Ago": days_ago,
+        "Breakout_Vol_x": brk_vol.round(2), "Vol_x_50d": vol_x_today,
+    })
+
+
+def build_table(prices, bench, meta, ohlcv=None):
+    """RS rating + Trend Template (+ stage / base / VCP / breakout columns if `ohlcv` is given)."""
     end_date = prices.index[-1]
     prev_date = prices.index[-1 - CHANGE_DAYS]
 
@@ -216,14 +437,17 @@ def build_table(prices, bench, meta):
         "RS_Change": rs_now - rs_prev.reindex(rs_now.index),
         "Weighted_Return_%": wr_now.reindex(rs_now.index).round(2),
     }).join(tech)
+    if ohlcv is not None:
+        out = out.join(pattern_table(prices, ohlcv, rs_now.index))
     out.index.name = "Ticker"
     out = out.reset_index().merge(meta, on="Ticker", how="left")
 
     front = ["Symbol", "Company Name", "Industry", "RS_Rating", "RS_Change",
-             "Weighted_Return_%", "TT_Score", "TT_Pass", "RS_Line_New_High",
-             "RS_Line_Near_High", "RS_Blue_Dot", "RS_Line_Uptrend", "RSI14",
-             "Close", "Pct_From_52W_High", "Pct_Above_52W_Low",
-             "SMA50", "SMA150", "SMA200"]
+             "Weighted_Return_%", "Stage", "TT_Score", "TT_Pass", "Stage1_Base", "VCP",
+             "VCP_Setup", "Vol_Breakout", "RS_Line_New_High", "RS_Line_Near_High",
+             "RS_Blue_Dot", "RS_Line_Uptrend", "RSI14", "Close", "Pct_From_52W_High",
+             "Pct_Above_52W_Low", "SMA50", "SMA150", "SMA200"]
+    front = [c for c in front if c in out.columns]
     rest = [c for c in out.columns if c not in front and c != "Ticker"]
     out = out[front + rest]
     return (out.sort_values(["RS_Rating", "Weighted_Return_%"], ascending=False)
@@ -436,11 +660,12 @@ def main():
     meta = get_nse500_symbols()
     print(f"Universe: {len(meta)} stocks")
 
-    prices = download_prices(meta["Ticker"].tolist())
+    md = download_market_data(meta["Ticker"].tolist())
+    prices = md["Close"]
     bench = get_benchmark()
     print(f"Price data for {prices.shape[1]} stocks, last date: {prices.index[-1].date()}")
 
-    result, as_of = build_table(prices, bench, meta)
+    result, as_of = build_table(prices, bench, meta, ohlcv=md)
     assert len(result) > 0, "No ratings produced - check price data above"
     print(f"\nRS Ratings as of {as_of.date()} (scan size: {len(result)} stocks)")
     skipped = prices.shape[1] - len(result)
@@ -463,6 +688,20 @@ def main():
     print(top[show].head(40).to_string(index=False))
     print(f"\n=== RS BLUE DOT (RS line at 52w high, price not yet): {len(blue)} ===")
     print(blue[show].head(40).to_string(index=False))
+
+    pat_cols = ["Symbol", "RS_Rating", "Stage", "VCP_Contractions", "Vol_Dry_Up", "Pivot",
+                "Pct_To_Pivot", "Breakout_Days_Ago", "Breakout_Vol_x", "Base_Days", "Close"]
+    setups = result[result.VCP_Setup]
+    brk = result[result.Vol_Breakout]
+    s1 = result[result.Stage1_Base].sort_values("Base_Days", ascending=False)
+    print(f"\n=== VCP SETUPS (tight, volume dried up, within {VCP_NEAR_PIVOT:.0f}% of pivot): {len(setups)} ===")
+    print(setups[pat_cols].head(30).to_string(index=False))
+    print(f"\n=== VOLUME BREAKOUTS (last {BREAKOUT_RECENT_DAYS} sessions): {len(brk)} ===")
+    print(brk[pat_cols].head(30).to_string(index=False))
+    print(f"\n=== STAGE 1 BASES FORMING: {len(s1)} ===")
+    print(s1[pat_cols].head(30).to_string(index=False))
+    result[result.VCP | result.Vol_Breakout | result.Stage1_Base].to_csv(
+        "nse500_vcp_breakout_stage1.csv", index=False)
 
     ind = industry_strength(result)
     print(f"\n=== INDUSTRY STRENGTH (top 15 of {len(ind)} industries) ===")
