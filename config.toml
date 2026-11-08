@@ -1,0 +1,8 @@
+# Optional file: gives sliders, checkboxes and links the app's indigo accent in light AND dark mode.
+# The app works fine without it (accents then stay Streamlit's default red).
+# Light/dark still follows each visitor's device automatically.
+[theme.light]
+primaryColor = "#6366f1"
+
+[theme.dark]
+primaryColor = "#818cf8"
