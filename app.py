@@ -1,17 +1,18 @@
 """
-NSE 500 RS Rating + Minervini Trend Template + VCP / breakout / Stage scanner - Streamlit app.
+Nifty Total Market (Nifty 500 + Microcap 250) RS Rating scanner - Streamlit app.
+RS Rating, Minervini Trend Template, VCP setups, volume breakouts, Weinstein stages,
+liquidity flag, market breadth and sector / industry strength.
 
 Run locally:   pip install -r requirements.txt && streamlit run app.py
 Deploy free:   push this folder to GitHub -> share.streamlit.io -> New app -> app.py
 Files needed in the same folder: app.py, ui.py, nse500_rs_rating.py, requirements.txt
+Optional:      nse_classification.csv (NSE industry / basic industry), ind_niftytotalmarket_list.csv
 """
-import io
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import requests
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -21,8 +22,9 @@ import ui  # noqa: E402
 
 CACHE_HOURS = 6
 IST = timezone(timedelta(hours=5, minutes=30))
+LIQ_TEXT = f"avg {m.LIQUIDITY_DAYS}-day traded value ≥ ₹{m.MIN_TRADED_VALUE_CR:.0f} crore"
 
-st.set_page_config(page_title="NSE 500 RS Scanner", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Total Market RS Scanner", page_icon="📈", layout="wide")
 
 # ---------------- Appearance (first, so the CSS can use the chosen font) ----------------
 with st.sidebar:
@@ -35,26 +37,10 @@ ui.inject_css(font)
 
 
 # ---------------- Data loading (cached, shared by all visitors) ----------------
-def parse_universe(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [c.strip() for c in df.columns]
-    df = df[["Company Name", "Industry", "Symbol"]].copy()
-    df["Ticker"] = df["Symbol"].str.strip() + ".NS"
-    return df
-
-
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def fetch_universe():
-    """Nifty 500 list: NSE download -> local ind_nifty500list.csv -> None."""
-    try:
-        r = requests.get(m.NSE500_URL, timeout=30,
-                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        r.raise_for_status()
-        return parse_universe(pd.read_csv(io.StringIO(r.text)))
-    except Exception:
-        local = os.path.join(HERE, "ind_nifty500list.csv")
-        if os.path.exists(local):
-            return parse_universe(pd.read_csv(local))
-        return None
+    """Nifty Total Market list: NSE -> local ind_niftytotalmarket_list.csv -> Nifty 500 + Microcap 250."""
+    return m.load_universe(local_file=os.path.join(HERE, m.LOCAL_UNIVERSE_FILE))
 
 
 @st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
@@ -68,15 +54,17 @@ def compute(meta: pd.DataFrame):
 
 meta = fetch_universe()
 if meta is None:
-    st.warning("Could not download the Nifty 500 list from NSE. Upload `ind_nifty500list.csv` "
-               "(from niftyindices.com), or add it to the app folder.")
-    up = st.file_uploader("ind_nifty500list.csv", type="csv")
+    st.warning("Could not download the Nifty Total Market list from NSE. Upload "
+               "`ind_niftytotalmarket_list.csv` (nseindia.com → Indices → Nifty Total Market → "
+               "Download list), or add it to the app folder.")
+    up = st.file_uploader("ind_niftytotalmarket_list.csv", type="csv")
     if up is None:
         st.stop()
-    meta = parse_universe(pd.read_csv(up))
+    meta = m.parse_universe(pd.read_csv(up))
+meta = m.attach_classification(meta, m.load_classification(os.path.join(HERE, m.CLASSIFICATION_FILE)))
 
 try:
-    with st.spinner("Downloading ~500 stocks from Yahoo Finance (first load takes 1-2 minutes)..."):
+    with st.spinner("Downloading ~750 stocks from Yahoo Finance (first load takes 2-3 minutes)..."):
         result, as_of, fetched_at, n_prices = compute(meta)
 except Exception as e:
     st.error(f"Data download failed: {e}")
@@ -84,26 +72,39 @@ except Exception as e:
         st.rerun()
     st.stop()
 
+has_cls = bool(result["Basic Industry"].notna().any()) if "Basic Industry" in result.columns else False
+n_liquid = int(result["Liquid"].sum())
+
 # ---------------- Sidebar filters ----------------
 with st.sidebar:
     st.subheader("Filters")
+    liquid_only = st.toggle("Liquid stocks only", value=False,
+                            help=f"Liquid = {LIQ_TEXT}. Applies to the stock lists. Breadth, sector and "
+                                 f"industry figures always use liquid stocks.")
     min_rs = st.slider("Minimum RS Rating", 1, 99, 1)
     pref_rs = st.slider("RS for 'Top picks'", 50, 99, m.PREFERRED_RS)
     rsi_min = st.slider("RSI above (Top picks)", 0, 80, 50)
-    industries = sorted(result["Industry"].dropna().unique())
-    pick_ind = st.multiselect("Industry", industries)
+    pick_sector = st.multiselect("Sector", sorted(result["Sector"].dropna().unique()))
+    pick_basic = (st.multiselect("Basic industry", sorted(result["Basic Industry"].dropna().unique()))
+                  if has_cls else [])
     q = st.text_input("Search symbol / company")
     st.divider()
     st.caption(f"Prices as of **{as_of.date()}**  \nFetched {fetched_at:%d %b %Y, %H:%M} IST  \n"
                f"Auto-refreshes every {CACHE_HOURS} hours")
     if st.button("🔄 Refresh data now", use_container_width=True):
         compute.clear()
+        fetch_universe.clear()
         st.rerun()
 
 # ---------------- Apply filters ----------------
-df = result[result["RS_Rating"] >= min_rs]
-if pick_ind:
-    df = df[df["Industry"].isin(pick_ind)]
+df = result
+if liquid_only:
+    df = df[df["Liquid"]]
+df = df[df["RS_Rating"] >= min_rs]
+if pick_sector:
+    df = df[df["Sector"].isin(pick_sector)]
+if pick_basic:
+    df = df[df["Basic Industry"].isin(pick_basic)]
 if q.strip():
     s = q.strip().lower()
     df = df[df["Symbol"].str.lower().str.contains(s, regex=False)
@@ -118,10 +119,10 @@ s1 = df[df.Stage1_Base].sort_values("Base_Days", ascending=False)
 
 # ---------------- Header + KPI cards ----------------
 ui.hero("RS Rating Scanner",
-        "Relative-strength ranking, Minervini Trend Template, VCP setups, volume breakouts and "
-        "Weinstein stages for every Nifty 500 stock.",
+        "Relative-strength ranking, Minervini Trend Template, VCP setups, volume breakouts, Weinstein "
+        "stages, market breadth and sector strength across the Nifty Total Market (Nifty 500 + Microcap 250).",
         [f"<b>As of</b> {as_of:%d %b %Y}", f"<b>Fetched</b> {fetched_at:%d %b, %H:%M} IST",
-         f"<b>{len(result)}</b> stocks rated"])
+         f"<b>{len(result)}</b> of {len(meta)} stocks rated", f"<b>{n_liquid}</b> liquid"])
 ui.kpis([
     ("Top picks", len(top), f"RS ≥ {pref_rs} + trend + RS line", "#10b981"),
     ("Trend Template", len(tt), "all 8 conditions", "#6366f1"),
@@ -129,42 +130,75 @@ ui.kpis([
     ("Volume breakouts", len(brk), f"last {m.BREAKOUT_RECENT_DAYS} sessions", "#f97316"),
     ("Stage 1 bases", len(s1), "early watch-list", "#3b82f6"),
     ("RS blue dot", len(blue), "RS line leads price", "#ec4899"),
+    ("Liquid stocks", n_liquid, f"of {len(result)} · ≥ ₹{m.MIN_TRADED_VALUE_CR:.0f} cr/day", "#14b8a6"),
 ])
 
 
-def show(frame, name, text, keys=None, sort=("RS_Rating", -1)):
-    ui.note(text)
-    ui.table(frame, keys or ui.COLS_DEFAULT, sort, font, density)
+def stock_cols(keys):
+    """Insert the NSE basic-industry column after Sector when the classification file is loaded."""
+    keys = list(keys)
+    if has_cls and "Sector" in keys:
+        keys.insert(keys.index("Sector") + 1, "Basic Industry")
+    return keys
+
+
+def show(frame, name, text, keys=None, sort=("RS_Rating", -1), titles=None):
+    ui.note(f"<b>{len(frame)}</b> stocks · {text}")
+    ui.table(frame, stock_cols(keys or ui.COLS_DEFAULT), sort, font, density, titles=titles)
     if not frame.empty:
         st.download_button("⬇️ Download CSV", frame.to_csv(index=False).encode("utf-8"),
-                           file_name=f"nse500_{name}_{as_of.date()}.csv", mime="text/csv",
+                           file_name=f"totalmarket_{name}_{as_of.date()}.csv", mime="text/csv",
                            key=f"dl_{name}")
 
 
-def show_industries():
-    ui.note("Industries ranked by a blend of <b>median RS Rating (50%)</b>, <b>share of stocks with RS ≥ 80 "
-            "(25%)</b> and <b>share passing the Trend Template (25%)</b>. Uses the whole NSE 500 - "
-            "sidebar filters don't apply.")
-    min_n = st.slider("Minimum stocks per industry", 1, 10, 3,
-                      help="Small industries give noisy scores, so they are hidden below this size.")
-    ind = m.industry_strength(result, min_stocks=min_n)
+def show_breadth_and_sectors():
+    b = m.market_breadth(result)
+    ui.note(f"Every figure on this tab uses <b>liquid stocks only</b> ({LIQ_TEXT}): "
+            f"<b>{b['stocks']}</b> of {len(result)} rated stocks. Sidebar filters don't apply here.")
+    ui.adv_dec(b["advancers"], b["decliners"], b["unchanged"])
+    ui.kpis([
+        ("52-week highs", b["new_52w_highs"], "closing basis", "#10b981"),
+        ("52-week lows", b["new_52w_lows"], "closing basis", "#ef4444"),
+        ("RS line at high", f"{b['pct_rsline_high']:.0f}%", "of liquid stocks", "#ec4899"),
+        ("RS ≥ 80", f"{b['pct_rs80']:.0f}%", "market leaders", "#6366f1"),
+    ])
+    ui.meters([
+        ("Above 50-day SMA", b["pct_above_50"], "short-term trend"),
+        ("Above 150-day SMA", b["pct_above_150"], "intermediate trend"),
+        ("Above 200-day SMA", b["pct_above_200"], "long-term trend"),
+        ("Stage 2 · Advancing", b["pct_stage2"], "price above a rising 30-week average"),
+        ("Pass Trend Template", b["pct_tt"], "all 8 Minervini conditions"),
+    ])
+
+    st.markdown("#### Sector & industry strength")
+    levels = ["Sector"] + (["Industry", "Basic Industry"] if has_cls else [])
+    level = st.radio("Group by", levels, horizontal=True,
+                     help="Sector = NSE's 22 sectors (from NSE's index list). Industry and Basic "
+                          "Industry come from NSE's 4-level classification file.")
+    if not has_cls:
+        st.caption("Industry / basic-industry levels need `nse_classification.csv` next to app.py - see "
+                   "the notes at the bottom of the page for the one-time setup.")
+    min_n = st.slider("Minimum liquid stocks per group", 1, 10, 3,
+                      help="Small groups give noisy scores, so they are hidden below this size.")
+    ind = m.industry_strength(result, min_stocks=min_n, level=level)
     if ind.empty:
-        st.info("No industries meet the minimum size.")
+        st.info("No groups meet the minimum size.")
         return
-    ui.table(ind, ui.COLS_INDUSTRY, ("Rank", 1), font, density)
+    ui.note(f"Ranked by a blend of <b>median RS Rating (50%)</b>, <b>share of stocks with RS ≥ 80 (25%)</b> "
+            f"and <b>share passing the Trend Template (25%)</b>.")
+    ui.table(ind, ui.COLS_INDUSTRY, ("Rank", 1), font, density, titles={"Group": level})
     st.download_button("⬇️ Download CSV", ind.to_csv(index=False).encode("utf-8"),
-                       file_name=f"nse500_industry_strength_{as_of.date()}.csv", mime="text/csv",
-                       key="dl_industry_table")
-    st.markdown("#### Stocks in an industry")
-    pick = st.selectbox("Choose an industry (listed by strength)", ind["Industry"].tolist())
-    members = result[result["Industry"] == pick].sort_values("RS_Rating", ascending=False)
-    show(members, "industry_stocks", f"All rated stocks in <b>{pick}</b>, sorted by RS Rating.")
+                       file_name=f"totalmarket_{level.lower().replace(' ', '_')}_strength_{as_of.date()}.csv",
+                       mime="text/csv", key="dl_group_table")
+    st.markdown(f"#### Stocks in a {level.lower()}")
+    pick = st.selectbox(f"Choose a {level.lower()} (listed by strength)", ind["Group"].tolist())
+    members = result[(result[level] == pick) & result["Liquid"]].sort_values("RS_Rating", ascending=False)
+    show(members, "group_stocks", f"Liquid stocks in <b>{pick}</b>, sorted by RS Rating.")
 
 
-(tab_top, tab_tt, tab_vcp, tab_brk, tab_s1, tab_blue, tab_ind, tab_all) = st.tabs([
-    f"Top picks · {len(top)}", f"Trend Template · {len(tt)}", f"VCP setups · {len(vcp)}",
-    f"Breakouts · {len(brk)}", f"Stage 1 bases · {len(s1)}", f"RS blue dot · {len(blue)}",
-    "Industries", f"All stocks · {len(df)}"])
+(tab_top, tab_tt, tab_vcp, tab_brk, tab_s1, tab_blue, tab_mkt, tab_all) = st.tabs([
+    "Top picks", "Trend Template", "VCP setups", "Breakouts", "Stage 1 bases", "RS blue dot",
+    "Breadth & sectors", "All stocks"])
 
 with tab_top:
     show(top, "top_picks", f"Passes all 8 Trend Template conditions, <b>RS ≥ {pref_rs}</b>, RS line within 5% "
@@ -194,22 +228,35 @@ with tab_s1:
 with tab_blue:
     show(blue, "blue_dot", f"RS line at a 52-week high while price is still more than 2% below its own high "
                            f"(RS ≥ {pref_rs}).")
-with tab_ind:
-    show_industries()
+with tab_mkt:
+    show_breadth_and_sectors()
 with tab_all:
     show(df.sort_values("RS_Rating", ascending=False), "all",
-         "Every rated stock. <b>Click any column header to sort.</b>")
+         "Every rated stock" + (" (liquid only)" if liquid_only else "") +
+         ". <b>Click any column header to sort.</b>")
 
 with st.expander("Notes & limitations"):
     st.markdown(
-        "- Stocks with less than 12 months of price history are not rated.\n"
-        "- 52-week high/low use closing prices, not intraday extremes.\n"
-        "- RS Rating is relative to the NSE 500 only, so it can differ from screeners that rank a wider universe.\n"
-        "- **Stages** use the 150-day SMA (about the 30-week average): Stage 2 = price above a rising average, "
-        "Stage 4 = below a falling one; Stage 1/3 = flat average after a decline/advance. Stocks with under ~13 "
-        "months of history show 'n/a'.\n"
-        "- **VCP, bases and breakouts are rule-based approximations** computed on daily closes/highs/lows. "
-        "They will flag some patterns a human would reject and miss others, so always confirm on the chart.\n"
-        "- Yahoo Finance data can have gaps; a few tickers may be missing on any given day.\n"
-        "- Educational tool, not investment advice."
+        f"- **Universe:** the Nifty Total Market list from NSE (Nifty 500 + Nifty Microcap 250, about 750 stocks). "
+        f"Placeholder `DUMMY…` rows are ignored; a few REIT units are included as NSE lists them.\n"
+        f"- **RS Rating** ranks every rated stock in this universe (1-99). Stocks with less than 12 months of "
+        f"price history, or with no Yahoo Finance data, are not rated.\n"
+        f"- **Liquid** = {LIQ_TEXT} (close × volume). The *Liquid stocks only* switch filters the stock lists; "
+        f"breadth, sector and industry figures always use liquid stocks.\n"
+        f"- **Sectors** are NSE's 22 sectors, taken from NSE's index list. **Industry** and **Basic industry** come "
+        f"from NSE's 4-level classification and appear only when `nse_classification.csv` is present "
+        f"(currently: {'loaded' if has_cls else 'not loaded'}).\n"
+        f"- 52-week high/low use closing prices, not intraday extremes.\n"
+        f"- **Stages** use the 150-day SMA (about the 30-week average): Stage 2 = price above a rising average, "
+        f"Stage 4 = below a falling one; Stage 1/3 = flat average after a decline/advance.\n"
+        f"- **VCP, bases and breakouts are rule-based approximations** computed on daily closes/highs/lows. "
+        f"They will flag some patterns a human would reject and miss others, so always confirm on the chart.\n"
+        f"- RS Line is measured against the Nifty 500 index (Yahoo Finance); Yahoo data can have gaps.\n"
+        f"- Educational tool, not investment advice."
     )
+    if not has_cls:
+        st.markdown(
+            "**One-time setup for industry & basic-industry levels:** in Colab or on your PC run "
+            "`build_classification_file()` from `nse500_rs_rating.py` (it asks NSE for each stock's "
+            "classification, about 8-10 minutes), then add the saved `nse_classification.csv` to the "
+            "GitHub repository next to `app.py`.")

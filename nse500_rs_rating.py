@@ -1,5 +1,5 @@
 # ============================================================
-# NSE 500 RS Rating + Minervini Trend Template scanner
+# Nifty Total Market (Nifty 500 + Microcap 250) RS Rating + Minervini scanner
 # Google Colab | Data: Yahoo Finance (yfinance)
 #
 # RS Rating (1-99):
@@ -18,6 +18,8 @@
 #
 # Output: CSVs + a self-contained web dashboard (nse500_rs_dashboard.html)
 # Extras: Weinstein stage (1-4), base detection, VCP + volume-breakout scans,
+#         Liquidity flag (avg 20-day traded value >= Rs 10 crore); sector, industry and breadth
+#         figures use liquid stocks only; optional NSE basic-industry classification.
 #         RS Line (stock / Nifty 500) new-high flags, RS "blue dot"
 #         (RS line at 52w high before price), RSI(14)
 # ============================================================
@@ -27,9 +29,11 @@
 
 import io
 import json
+import os
 import time
 import warnings
 import requests
+from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -50,7 +54,19 @@ MAX_BELOW_52W_HIGH = 0.25        # within 25% of 52w high
 RS_NEAR_HIGH = 0.95              # RS line within 5% of its 52w high = "near high"
 BLUE_DOT_PRICE_GAP = 0.02        # price still >2% below its own 52w high
 
-NSE500_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+# ---- Universe: Nifty Total Market = Nifty 500 + Nifty Microcap 250 (about 750 stocks) ----
+UNIVERSE_NAME = "Nifty Total Market"
+UNIVERSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"
+UNIVERSE_FALLBACK_URLS = (       # used if the Total Market file is unavailable
+    "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+    "https://nsearchives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv",
+)
+LOCAL_UNIVERSE_FILE = "ind_niftytotalmarket_list.csv"   # optional local copy of the NSE list
+CLASSIFICATION_FILE = "nse_classification.csv"          # optional cache: NSE industry / basic industry
+
+# ---- Liquidity ----
+LIQUIDITY_DAYS = 20              # sessions averaged
+MIN_TRADED_VALUE_CR = 10.0       # liquid = avg daily traded value (close x volume) >= Rs 10 crore
 
 # ---- Stage analysis (Weinstein, 30-week MA ~ 150-day SMA) ----
 STAGE_SLOPE_DAYS = 30            # slope of the 150 SMA measured over 30 sessions (~6 weeks)
@@ -78,23 +94,154 @@ BREAKOUT_VOL_X = 1.5             # volume >= 1.5x the prior 50-day average
 BREAKOUT_RECENT_DAYS = 3         # look back over the last 3 sessions
 
 
-# ---------------- 1. NSE 500 constituents ----------------
-def get_nse500_symbols():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        r = requests.get(NSE500_URL, headers=headers, timeout=30)
-        r.raise_for_status()
-        df = pd.read_csv(io.StringIO(r.text))
-    except Exception as e:
-        print(f"Could not download list from NSE ({e}).")
-        print("Please upload 'ind_nifty500list.csv' (from niftyindices.com).")
-        from google.colab import files
-        up = files.upload()
-        df = pd.read_csv(io.BytesIO(next(iter(up.values()))))
+# ---------------- 1. Universe + NSE classification ----------------
+_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+_CLS_COLS = ["Macro Sector", "Industry", "Basic Industry"]
+
+
+def parse_universe(df):
+    """Normalise an NSE index-constituent CSV. NSE's 'Industry' column there is the NSE *Sector*
+    level (22 sectors), so it becomes 'Sector'. Placeholder 'DUMMY...' rows are dropped."""
+    df = df.copy()
     df.columns = [c.strip() for c in df.columns]
-    return df[["Company Name", "Industry", "Symbol"]].assign(
-        Ticker=lambda d: d["Symbol"].str.strip() + ".NS"
-    )
+    df = df.rename(columns={"Industry": "Sector"})
+    for c in ("Series", "ISIN Code"):
+        if c not in df.columns:
+            df[c] = ""
+    df["Symbol"] = df["Symbol"].astype(str).str.strip()
+    df["Sector"] = df["Sector"].astype(str).str.strip()
+    dummy = (df["Symbol"].str.upper().str.startswith("DUMMY")
+             | df["ISIN Code"].astype(str).str.upper().str.startswith("DUM"))
+    df = df[~dummy].drop_duplicates("Symbol")
+    df["Ticker"] = df["Symbol"] + ".NS"
+    return df[["Company Name", "Sector", "Symbol", "Series", "ISIN Code", "Ticker"]].reset_index(drop=True)
+
+
+def _download_csv(url):
+    r = requests.get(url, headers=_HEADERS, timeout=30)
+    r.raise_for_status()
+    return pd.read_csv(io.StringIO(r.text))
+
+
+def load_universe(local_file=None):
+    """Nifty Total Market constituents: official NSE CSV -> local copy -> Nifty 500 + Microcap 250.
+    Returns None if nothing is available."""
+    local_file = local_file or LOCAL_UNIVERSE_FILE
+    try:
+        return parse_universe(_download_csv(UNIVERSE_URL))
+    except Exception as e:
+        print(f"Could not download {UNIVERSE_NAME} list from NSE ({e}).")
+    if os.path.exists(local_file):
+        print(f"Using local file {local_file}")
+        return parse_universe(pd.read_csv(local_file))
+    try:
+        parts = [_download_csv(u) for u in UNIVERSE_FALLBACK_URLS]
+        print("Built the universe from Nifty 500 + Nifty Microcap 250 instead.")
+        return parse_universe(pd.concat(parts, ignore_index=True))
+    except Exception as e:
+        print(f"Fallback lists also failed ({e}).")
+        return None
+
+
+def load_classification(path=None):
+    """Cached NSE classification (Symbol, Macro Sector, Industry, Basic Industry); empty if absent."""
+    path = path or CLASSIFICATION_FILE
+    cols = ["Symbol"] + _CLS_COLS
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            if "Symbol" in df.columns:
+                for c in _CLS_COLS:
+                    if c not in df.columns:
+                        df[c] = np.nan
+                return df[cols].dropna(subset=["Symbol"]).drop_duplicates("Symbol")
+        except Exception as e:
+            print(f"Could not read {path} ({e})")
+    return pd.DataFrame(columns=cols)
+
+
+def attach_classification(meta, cls):
+    """Add Macro Sector / Industry / Basic Industry (NaN where unknown) to the universe table."""
+    meta = meta.drop(columns=[c for c in _CLS_COLS if c in meta.columns])
+    if cls is None or cls.empty:
+        for c in _CLS_COLS:
+            meta[c] = np.nan
+        return meta
+    return meta.merge(cls[["Symbol"] + _CLS_COLS].drop_duplicates("Symbol"), on="Symbol", how="left")
+
+
+def _nse_session():
+    s = requests.Session()
+    s.headers.update({**_HEADERS, "Accept": "application/json, text/plain, */*",
+                      "Accept-Language": "en-US,en;q=0.9"})
+    s.get("https://www.nseindia.com/", timeout=20)          # sets the cookies the API expects
+    return s
+
+
+def fetch_classification(symbols, existing=None, delay=0.6, max_consecutive_fail=15,
+                         save_to=None, session=None):
+    """Best-effort download of NSE's 4-level classification (macro sector, sector, industry,
+    basic industry) from NSE's quote API, one symbol at a time. Resumable: symbols already in
+    `existing` are skipped. NSE often blocks cloud servers, so run this on your own machine or
+    Colab, then keep the saved CSV."""
+    existing = existing if existing is not None else pd.DataFrame(columns=["Symbol"] + _CLS_COLS)
+    done = set(existing["Symbol"]) if len(existing) else set()
+    todo = [x for x in symbols if x not in done]
+    if not todo:
+        return existing
+    sess = session or _nse_session()
+    rows, fails = [], 0
+
+    def _save():
+        out = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True)
+        if save_to:
+            out.to_csv(save_to, index=False)
+        return out
+
+    for i, sym in enumerate(todo, 1):
+        info = None
+        try:
+            r = sess.get("https://www.nseindia.com/api/quote-equity", params={"symbol": sym},
+                         headers={"Referer": f"https://www.nseindia.com/get-quotes/equity?symbol={quote(sym)}"},
+                         timeout=20)
+            if r.status_code == 200:
+                info = (r.json() or {}).get("industryInfo")
+        except Exception:
+            info = None
+        if info and info.get("basicIndustry"):
+            rows.append({"Symbol": sym, "Macro Sector": info.get("macro"), "Industry": info.get("industry"),
+                         "Basic Industry": info.get("basicIndustry")})
+            fails = 0
+        else:
+            fails += 1
+            if fails >= max_consecutive_fail:
+                print(f"NSE stopped answering after {i} symbols (blocked?). Saved what we have; "
+                      f"run again later or from another network to continue.")
+                break
+        if i % 50 == 0:
+            print(f"  classified {i}/{len(todo)}")
+            _save()
+        time.sleep(delay)
+    return _save()
+
+
+def build_classification_file(path=None):
+    """One-off helper: download NSE industry / basic-industry for every stock in the universe
+    and cache it in nse_classification.csv (run in Colab or on your PC, then upload the file
+    next to app.py)."""
+    path = path or CLASSIFICATION_FILE
+    meta = load_universe()
+    if meta is None:
+        print("No universe available."); return None
+    cls = fetch_classification(meta["Symbol"].tolist(), existing=load_classification(path), save_to=path)
+    cov = int(cls["Basic Industry"].notna().sum()) if len(cls) else 0
+    print(f"Saved {path}: {cov} of {len(meta)} stocks classified.")
+    try:
+        from google.colab import files
+        files.download(path)
+    except Exception:
+        pass
+    return cls
 
 
 # ---------------- 2. Price download ----------------
@@ -236,6 +383,7 @@ def technicals(prices, bench, rs_now):
         "Pct_Above_52W_Low": ((last / lo52 - 1) * 100).round(1),
         "SMA50": s50.round(2), "SMA150": s150.round(2), "SMA200": s200.round(2),
         "RSI14": rsi_wilder(p).iloc[-1].round(1),
+        "Chg_1D_%": ((last / p.iloc[-2] - 1) * 100).round(2),
         "RS_Line_New_High": rsl_new_high,
         "RS_Line_Near_High": rsl_near_high,
         "RS_Line_Uptrend": rsl_uptrend,
@@ -421,6 +569,16 @@ def pattern_table(prices, ohlcv, idx):
     })
 
 
+def liquidity_table(prices, volume, idx):
+    """Average daily traded value (close x volume) over the last LIQUIDITY_DAYS sessions, in Rs crore.
+    A stock is 'liquid' when that is at least MIN_TRADED_VALUE_CR."""
+    vol = volume.reindex(index=prices.index, columns=idx)
+    traded = (prices[idx] * vol).iloc[-LIQUIDITY_DAYS:]
+    avg_cr = traded.mean() / 1e7                      # 1 crore = 10,000,000
+    return pd.DataFrame({"Avg_Value_Cr": avg_cr.round(1),
+                         "Liquid": (avg_cr >= MIN_TRADED_VALUE_CR).fillna(False).astype(bool)})
+
+
 def build_table(prices, bench, meta, ohlcv=None):
     """RS rating + Trend Template (+ stage / base / VCP / breakout columns if `ohlcv` is given)."""
     end_date = prices.index[-1]
@@ -439,12 +597,15 @@ def build_table(prices, bench, meta, ohlcv=None):
     }).join(tech)
     if ohlcv is not None:
         out = out.join(pattern_table(prices, ohlcv, rs_now.index))
+        out = out.join(liquidity_table(prices, ohlcv["Volume"], rs_now.index))
     out.index.name = "Ticker"
-    out = out.reset_index().merge(meta, on="Ticker", how="left")
+    keep = [c for c in ["Ticker", "Company Name", "Sector", "Symbol", "Series",
+                        "Macro Sector", "Industry", "Basic Industry"] if c in meta.columns]
+    out = out.reset_index().merge(meta[keep], on="Ticker", how="left")
 
-    front = ["Symbol", "Company Name", "Industry", "RS_Rating", "RS_Change",
+    front = ["Symbol", "Company Name", "Sector", "RS_Rating", "RS_Change",
              "Weighted_Return_%", "Stage", "TT_Score", "TT_Pass", "Stage1_Base", "VCP",
-             "VCP_Setup", "Vol_Breakout", "RS_Line_New_High", "RS_Line_Near_High",
+             "VCP_Setup", "Vol_Breakout", "Liquid", "Avg_Value_Cr", "RS_Line_New_High", "RS_Line_Near_High",
              "RS_Blue_Dot", "RS_Line_Uptrend", "RSI14", "Close", "Pct_From_52W_High",
              "Pct_Above_52W_Low", "SMA50", "SMA150", "SMA200"]
     front = [c for c in front if c in out.columns]
@@ -454,16 +615,25 @@ def build_table(prices, bench, meta, ohlcv=None):
                .reset_index(drop=True), end_date)
 
 
-def industry_strength(result, min_stocks=3):
-    """Rank industries by how strong their stocks are.
-    Industry score (1-99) = percentile rank of a blend of:
-      50% median RS Rating, 25% share of stocks with RS >= 80,
-      25% share of stocks passing the Trend Template.
-    Industries with fewer than `min_stocks` rated stocks are skipped (too noisy)."""
-    r = result.dropna(subset=["Industry"]).assign(_leader=lambda d: d["RS_Rating"] >= 80)
-    g = r.groupby("Industry")
+def industry_strength(result, min_stocks=3, level="Sector", liquid_only=True):
+    """Rank sectors / industries / basic industries by the strength of their stocks.
+    Uses liquid stocks only (avg 20-day traded value >= Rs 10 crore) unless liquid_only=False.
+    level: "Sector" (NSE's 22 sectors, always available), or "Industry" / "Basic Industry" /
+    "Macro Sector" when the NSE classification file is loaded.
+    Score (1-99) = percentile rank of 50% median RS Rating + 25% share of stocks with RS >= 80
+    + 25% share passing the Trend Template. Groups with fewer than `min_stocks` stocks are skipped."""
+    if level not in result.columns:
+        return pd.DataFrame()
+    r = result
+    if liquid_only and "Liquid" in r.columns:
+        r = r[r["Liquid"]]
+    r = r[r[level].notna() & (r[level].astype(str).str.strip() != "")]
+    r = r.assign(_leader=lambda d: d["RS_Rating"] >= 80,
+                 _a200=lambda d: d["Close"] > d["SMA200"],
+                 _s2=lambda d: d["Stage"].eq(STAGE_NAMES[2]) if "Stage" in d.columns else False)
+    g = r.groupby(level)
     leaders = (r.sort_values("RS_Rating", ascending=False)
-                .groupby("Industry")["Symbol"].apply(lambda s: ", ".join(s.head(3))))
+                .groupby(level)["Symbol"].apply(lambda x: ", ".join(x.head(3))))
     out = pd.DataFrame({
         "Stocks": g.size(),
         "Median_RS": g["RS_Rating"].median(),
@@ -471,11 +641,14 @@ def industry_strength(result, min_stocks=3):
         "Avg_RS_Change": g["RS_Change"].mean(),
         "Pct_RS80": g["_leader"].mean() * 100,
         "Pct_TT_Pass": g["TT_Pass"].mean() * 100,
+        "Pct_Above_200": g["_a200"].mean() * 100,
+        "Pct_Stage2": g["_s2"].mean() * 100,
         "TT_Pass_Count": g["TT_Pass"].sum(),
         "Blue_Dots": g["RS_Blue_Dot"].sum(),
         "Avg_Weighted_Return_%": g["Weighted_Return_%"].mean(),
         "Top_Stocks": leaders,
     })
+    out.index.name = "Group"
     out = out[out["Stocks"] >= min_stocks]
     if out.empty:
         return out.reset_index()
@@ -486,17 +659,45 @@ def industry_strength(result, min_stocks=3):
     out.insert(0, "Rank", range(1, len(out) + 1))
     for c in ["Median_RS", "Avg_RS", "Avg_RS_Change", "Avg_Weighted_Return_%"]:
         out[c] = out[c].round(1)
-    for c in ["Pct_RS80", "Pct_TT_Pass"]:
+    for c in ["Pct_RS80", "Pct_TT_Pass", "Pct_Above_200", "Pct_Stage2"]:
         out[c] = out[c].round(0)
     out[["TT_Pass_Count", "Blue_Dots"]] = out[["TT_Pass_Count", "Blue_Dots"]].astype(int)
     return out.reset_index()
+
+
+def market_breadth(result, liquid_only=True):
+    """Market-breadth snapshot (liquid stocks only by default): advancers/decliners, share of stocks
+    above their 50/150/200-day averages, Stage 2, Trend Template and RS >= 80, 52-week highs/lows."""
+    r = result
+    if liquid_only and "Liquid" in r.columns:
+        r = r[r["Liquid"]]
+    n = len(r)
+
+    def pct(mask):
+        return round(float(mask.mean() * 100), 1) if n else 0.0
+
+    chg = r["Chg_1D_%"]
+    return {
+        "stocks": n,
+        "advancers": int((chg > 0).sum()), "decliners": int((chg < 0).sum()),
+        "unchanged": int((chg == 0).sum()),
+        "pct_above_50": pct(r["Close"] > r["SMA50"]),
+        "pct_above_150": pct(r["Close"] > r["SMA150"]),
+        "pct_above_200": pct(r["Close"] > r["SMA200"]),
+        "pct_stage2": pct(r["Stage"].eq(STAGE_NAMES[2])) if "Stage" in r.columns else 0.0,
+        "pct_tt": pct(r["TT_Pass"]),
+        "pct_rs80": pct(r["RS_Rating"] >= 80),
+        "pct_rsline_high": pct(r["RS_Line_New_High"]),
+        "new_52w_highs": int((r["Pct_From_52W_High"] >= 0).sum()),
+        "new_52w_lows": int((r["Pct_Above_52W_Low"] <= 0).sum()),
+    }
 
 
 # ---------------- 5. Web dashboard (single self-contained HTML file) ----------------
 DASHBOARD_TEMPLATE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NSE 500 RS Rating Scanner</title>
+<title>Nifty Total Market RS Scanner</title>
 <style>
 :root{--bg:#fafaf8;--surface:#fff;--text:#1d1d1b;--muted:#6b6b66;--border:#e3e2dc;--hover:#f3f2ee;--accent:#2a5bd7;
 --g1:#0f7b4a;--g1b:#d6f0e2;--g2:#2e7d32;--g2b:#e6f4d9;--g3:#8a6d00;--g3b:#fbf0cc;--g4:#6b6b66;--g4b:#ecebe6;--g5:#b3261e;--g5b:#fadedb;}
@@ -536,13 +737,13 @@ td.txt{color:var(--muted);max-width:240px;overflow:hidden;text-overflow:ellipsis
 .empty{padding:30px;text-align:center;color:var(--muted)}
 .foot{padding:0 20px 20px;color:var(--muted);font-size:12px}
 </style></head><body>
-<header><h1>NSE 500 RS Rating Scanner</h1>
+<header><h1>Nifty Total Market RS Scanner</h1>
 <div class="sub" id="sub"></div></header>
 <div class="tabs" id="tabs"></div>
 <div class="controls">
 <input id="q" type="search" placeholder="Search symbol / company">
 <label>Min RS <input id="minrs" type="number" min="0" max="99" value="0"></label>
-<select id="ind"><option value="">All industries</option></select>
+<select id="ind"><option value="">All sectors</option></select>
 <button id="csv">Download CSV</button>
 <span class="sub" id="count"></span>
 </div>
@@ -556,7 +757,7 @@ const rows = P.rows;
 const COLS = [
  {k:'Symbol',t:'Symbol',type:'sym',l:1},
  {k:'Company Name',t:'Company',type:'txt',l:1},
- {k:'Industry',t:'Industry',type:'txt',l:1},
+ {k:'Sector',t:'Sector',type:'txt',l:1},
  {k:'RS_Rating',t:'RS',type:'rs'},
  {k:'RS_Change',t:'Chg',type:'chg'},
  {k:'TT_Score',t:'TT',type:'tt'},
@@ -580,7 +781,7 @@ const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&l
 const fmt = (v,d) => (v==null?'-':Number(v).toFixed(d));
 
 $('sub').textContent = 'Data as of ' + P.asof + ' | ' + rows.length + ' stocks rated | Top picks = Trend Template + RS >= ' + P.pref + ' + RS Line near high + RSI > 50';
-[...new Set(rows.map(r=>r.Industry).filter(Boolean))].sort().forEach(i=>{
+[...new Set(rows.map(r=>r.Sector).filter(Boolean))].sort().forEach(i=>{
   const o=document.createElement('option'); o.value=i; o.textContent=i; $('ind').appendChild(o);
 });
 
@@ -614,7 +815,7 @@ function cell(c,r){
 }
 function filtered(){
   const q=$('q').value.trim().toLowerCase(), minrs=+$('minrs').value||0, ind=$('ind').value;
-  let out = rows.filter(TABS[tab].f).filter(r=>r.RS_Rating>=minrs && (!ind||r.Industry===ind) &&
+  let out = rows.filter(TABS[tab].f).filter(r=>r.RS_Rating>=minrs && (!ind||r.Sector===ind) &&
     (!q || (r.Symbol||'').toLowerCase().includes(q) || (r['Company Name']||'').toLowerCase().includes(q)));
   out.sort((a,b)=>{
     let x=a[sortK], y=b[sortK];
@@ -657,8 +858,17 @@ def build_dashboard(result, as_of, path="nse500_rs_dashboard.html"):
 
 # ---------------- 6. Run ----------------
 def main():
-    meta = get_nse500_symbols()
-    print(f"Universe: {len(meta)} stocks")
+    meta = load_universe()
+    if meta is None:                       # last resort in Colab: upload the NSE list by hand
+        print(f"Please upload '{LOCAL_UNIVERSE_FILE}' (Nifty Total Market list from nseindia.com).")
+        from google.colab import files
+        up = files.upload()
+        meta = parse_universe(pd.read_csv(io.BytesIO(next(iter(up.values())))))
+    meta = attach_classification(meta, load_classification())
+    n_cls = int(meta["Basic Industry"].notna().sum())
+    print(f"Universe: {len(meta)} stocks ({UNIVERSE_NAME}); NSE industry classification for {n_cls} of them")
+    if n_cls == 0:
+        print("  (tip: run build_classification_file() once to add NSE industry / basic industry)")
 
     md = download_market_data(meta["Ticker"].tolist())
     prices = md["Close"]
@@ -667,15 +877,25 @@ def main():
 
     result, as_of = build_table(prices, bench, meta, ohlcv=md)
     assert len(result) > 0, "No ratings produced - check price data above"
+    n_liq = int(result["Liquid"].sum())
     print(f"\nRS Ratings as of {as_of.date()} (scan size: {len(result)} stocks)")
+    print(f"Liquid stocks (avg {LIQUIDITY_DAYS}-day traded value >= Rs {MIN_TRADED_VALUE_CR:.0f} crore): "
+          f"{n_liq} of {len(result)}")
     skipped = prices.shape[1] - len(result)
     if skipped:
         print(f"({skipped} stocks skipped: less than 12 months of history)")
 
-    show = ["Symbol", "RS_Rating", "RS_Change", "TT_Score", "RS_Line_New_High",
+    show = ["Symbol", "RS_Rating", "RS_Change", "TT_Score", "Liquid", "Avg_Value_Cr", "RS_Line_New_High",
             "RS_Blue_Dot", "RSI14", "Close", "Pct_From_52W_High", "Pct_Above_52W_Low"]
     pd.set_option("display.width", 220)
     pd.set_option("display.max_columns", None)
+
+    b = market_breadth(result)
+    print(f"\n=== MARKET BREADTH (liquid stocks only: {b['stocks']}) ===")
+    print(f"Advancers {b['advancers']} | Decliners {b['decliners']} | Unchanged {b['unchanged']}")
+    print(f"Above 50 SMA {b['pct_above_50']}% | above 150 SMA {b['pct_above_150']}% | above 200 SMA {b['pct_above_200']}%")
+    print(f"Stage 2 {b['pct_stage2']}% | Trend Template {b['pct_tt']}% | RS>=80 {b['pct_rs80']}%")
+    print(f"New 52-week highs {b['new_52w_highs']} | new 52-week lows {b['new_52w_lows']}")
 
     tt = result[result.TT_Pass]
     top = result[result.TT_Pass & (result.RS_Rating >= PREFERRED_RS)
@@ -690,7 +910,7 @@ def main():
     print(blue[show].head(40).to_string(index=False))
 
     pat_cols = ["Symbol", "RS_Rating", "Stage", "VCP_Contractions", "Vol_Dry_Up", "Pivot",
-                "Pct_To_Pivot", "Breakout_Days_Ago", "Breakout_Vol_x", "Base_Days", "Close"]
+                "Pct_To_Pivot", "Breakout_Days_Ago", "Breakout_Vol_x", "Base_Days", "Liquid", "Close"]
     setups = result[result.VCP_Setup]
     brk = result[result.Vol_Breakout]
     s1 = result[result.Stage1_Base].sort_values("Base_Days", ascending=False)
@@ -703,11 +923,14 @@ def main():
     result[result.VCP | result.Vol_Breakout | result.Stage1_Base].to_csv(
         "nse500_vcp_breakout_stage1.csv", index=False)
 
-    ind = industry_strength(result)
-    print(f"\n=== INDUSTRY STRENGTH (top 15 of {len(ind)} industries) ===")
-    print(ind[["Rank", "Industry", "Industry_Score", "Stocks", "Median_RS", "Pct_RS80",
-               "Pct_TT_Pass", "Top_Stocks"]].head(15).to_string(index=False))
-    ind.to_csv("nse500_industry_strength.csv", index=False)
+    for level in ("Sector", "Industry", "Basic Industry"):
+        ind = industry_strength(result, level=level)
+        if ind.empty:
+            continue
+        print(f"\n=== {level.upper()} STRENGTH - liquid stocks only (top 15 of {len(ind)}) ===")
+        print(ind[["Rank", "Group", "Industry_Score", "Stocks", "Median_RS", "Pct_RS80",
+                   "Pct_TT_Pass", "Top_Stocks"]].head(15).to_string(index=False))
+        ind.to_csv(f"nse500_{level.lower().replace(' ', '_')}_strength.csv", index=False)
 
     result.to_csv("nse500_rs_rating_full.csv", index=False)
     tt.to_csv("nse500_trend_template_pass.csv", index=False)
