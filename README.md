@@ -6,7 +6,7 @@ A Streamlit scanner for Nifty Total Market constituents. The official index comb
 
 - RS ratings, Minervini Trend Template, VCP setups, volume breakouts and Weinstein stages across the full available constituent list.
 - Per-stock 20-session average traded value (close × volume) and a liquid flag. A stock is liquid at ₹10 crore or more; the optional sidebar filter can limit stock screens to liquid names.
-- Optional market-cap filters for stocks above ₹500 crore or ₹1,000 crore. Market caps load from Yahoo Finance only when a threshold is selected and are cached for 24 hours.
+- Adjustable market-cap threshold in ₹ crore, plus an option to include stocks whose market cap is unavailable. Market caps load from Yahoo Finance when the threshold is above zero and are cached for 24 hours.
 - Basic-industry strength and market breadth summaries calculated from liquid stocks only.
 - Breadth percentages for liquid stocks above their 50, 150 and 200-day averages, plus Trend Template and Stage 2 counts.
 - Stock detail candlesticks with EMA 10/21, SMA 50/200, volume with its 50-session average, and a relative-strength panel against Nifty 500.

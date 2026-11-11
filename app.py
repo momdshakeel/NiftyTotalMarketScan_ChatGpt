@@ -133,9 +133,16 @@ with st.sidebar:
     pick_ind = st.multiselect("Basic industry", industries)
     liquid_only = st.checkbox("Only show liquid stocks", value=False,
                               help="Liquid means average close × volume of at least ₹10 crore over the last 20 sessions.")
-    min_market_cap = st.selectbox("Minimum market cap", [0, 500, 1000], format_func=lambda v: {
-        0: "Any market cap", 500: "> ₹500 Cr", 1000: "> ₹1,000 Cr"
-    }[v], help="Yahoo Finance market cap, cached for 24 hours. Fetching it for the full universe happens only when a cap filter is selected.")
+    min_market_cap = st.number_input(
+        "Market cap above (₹ crore)", min_value=0, max_value=1_000_000,
+        value=500, step=100,
+        help="Stocks must have market capitalization strictly above this value. Set to 0 to disable the filter.",
+    )
+    include_unknown_market_cap = st.checkbox(
+        "Include unknown market cap", value=False,
+        help="Keep stocks when Yahoo Finance does not provide a market-cap value.",
+        disabled=min_market_cap == 0,
+    )
     q = st.text_input("Search symbol / company")
     st.divider()
     st.caption(f"Prices as of **{as_of.date()}**  \nFetched {fetched_at:%d %b %Y, %H:%M} IST  \n"
@@ -153,7 +160,9 @@ if min_market_cap:
         lambda s: market_caps.get(f"{str(s).strip()}.NS") if pd.notna(s) else None)
     cap_coverage = int(result["Market_Cap_Cr"].notna().sum())
     if cap_coverage < len(result):
-        st.warning(f"Market cap data is available for {cap_coverage} of {len(result)} rated stocks. Stocks without a value are excluded by the active cap filter.")
+        missing_count = len(result) - cap_coverage
+        missing_action = "kept" if include_unknown_market_cap else "excluded"
+        st.warning(f"Market cap data is available for {cap_coverage} of {len(result)} rated stocks. {missing_count} stocks with unknown values will be {missing_action}.")
 
 df = result[result["RS_Rating"] >= min_rs]
 if pick_ind:
@@ -161,7 +170,10 @@ if pick_ind:
 if liquid_only:
     df = df[df["Liquid"].fillna(False)]
 if min_market_cap:
-    df = df[df["Market_Cap_Cr"] > min_market_cap]
+    cap_match = df["Market_Cap_Cr"] > min_market_cap
+    if include_unknown_market_cap:
+        cap_match |= df["Market_Cap_Cr"].isna()
+    df = df[cap_match]
 if q.strip():
     s = q.strip().lower()
     df = df[df["Symbol"].str.lower().str.contains(s, regex=False)
@@ -235,11 +247,17 @@ def show_breadth():
     }
     st.markdown("#### Nifty Total Market breadth")
     st.caption("Breadth uses liquid stocks only: 20-session average close × volume ≥ ₹10 crore.")
-    cols = st.columns(len(metric_map) + 1)
-    cols[0].metric("Liquid stocks", f"{len(liquid)} / {len(result)}")
-    for col, (label, condition) in zip(cols[1:], metric_map.items()):
-        pct = condition.fillna(False).mean() * 100
-        col.metric(label, f"{pct:.1f}%", f"{int(condition.fillna(False).sum())} stocks")
+    breadth_metrics = [("Liquid stocks", f"{len(liquid)} / {len(result)}", None)]
+    for label, condition in metric_map.items():
+        valid_condition = condition.fillna(False)
+        pct = valid_condition.mean() * 100
+        breadth_metrics.append((label, f"{pct:.1f}%",
+                                f"{int(valid_condition.sum())} stocks"))
+    # Three cards per row keep metric labels and values readable on the wide dashboard.
+    for start in range(0, len(breadth_metrics), 3):
+        cols = st.columns(3, gap="medium")
+        for col, (label, value, detail) in zip(cols, breadth_metrics[start:start + 3]):
+            col.metric(label, value, detail)
     summaries = []
     for group_col in ("Sector", "Industry", "Basic Industry"):
         if group_col not in liquid.columns or not liquid[group_col].notna().any():
