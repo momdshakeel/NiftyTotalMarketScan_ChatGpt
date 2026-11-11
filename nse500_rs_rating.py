@@ -31,6 +31,7 @@ import io
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 import warnings
 import requests
 from urllib.parse import quote
@@ -63,6 +64,9 @@ UNIVERSE_FALLBACK_URLS = (       # used if the Total Market file is unavailable
 )
 LOCAL_UNIVERSE_FILE = "ind_niftytotalmarket_list.csv"   # optional local copy of the NSE list
 CLASSIFICATION_FILE = "nse_classification.csv"          # optional cache: NSE industry / basic industry
+
+# ---- Market cap (shares outstanding x latest close, in Rs crore) ----
+MIN_MARKET_CAP_CR = 500.0        # stock-list filter: market cap above Rs 500 crore (0 = off)
 
 # ---- Liquidity ----
 LIQUIDITY_DAYS = 20              # sessions averaged
@@ -569,6 +573,34 @@ def pattern_table(prices, ohlcv, idx):
     })
 
 
+def download_shares(tickers, workers=8):
+    """Shares outstanding per ticker from Yahoo Finance (NaN where Yahoo has none).
+    Share counts change rarely, so cache the result (the app keeps it for 7 days)."""
+    def one(t):
+        try:
+            fi = yf.Ticker(t).fast_info
+            sh = None
+            try:
+                sh = fi["shares"]
+            except Exception:
+                sh = None
+            if not sh:                                   # fall back to market cap / last price
+                mc, lp = fi["market_cap"], fi["last_price"]
+                sh = mc / lp if mc and lp else None
+            return t, (float(sh) if sh else np.nan)
+        except Exception:
+            return t, np.nan
+    tickers = list(tickers)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        res = list(ex.map(one, tickers))
+    return pd.Series(dict(res), name="Shares").reindex(tickers)
+
+
+def market_cap_cr(prices, shares, idx):
+    """Market cap in Rs crore = shares outstanding x latest close / 1e7 (NaN if shares unknown)."""
+    return (shares.reindex(idx) * prices[idx].iloc[-1] / 1e7).round(0)
+
+
 def liquidity_table(prices, volume, idx):
     """Average daily traded value (close x volume) over the last LIQUIDITY_DAYS sessions, in Rs crore.
     A stock is 'liquid' when that is at least MIN_TRADED_VALUE_CR."""
@@ -579,7 +611,7 @@ def liquidity_table(prices, volume, idx):
                          "Liquid": (avg_cr >= MIN_TRADED_VALUE_CR).fillna(False).astype(bool)})
 
 
-def build_table(prices, bench, meta, ohlcv=None):
+def build_table(prices, bench, meta, ohlcv=None, shares=None):
     """RS rating + Trend Template (+ stage / base / VCP / breakout columns if `ohlcv` is given)."""
     end_date = prices.index[-1]
     prev_date = prices.index[-1 - CHANGE_DAYS]
@@ -598,6 +630,8 @@ def build_table(prices, bench, meta, ohlcv=None):
     if ohlcv is not None:
         out = out.join(pattern_table(prices, ohlcv, rs_now.index))
         out = out.join(liquidity_table(prices, ohlcv["Volume"], rs_now.index))
+    if shares is not None:
+        out["Market_Cap_Cr"] = market_cap_cr(prices, shares, out.index)
     out.index.name = "Ticker"
     keep = [c for c in ["Ticker", "Company Name", "Sector", "Symbol", "Series",
                         "Macro Sector", "Industry", "Basic Industry"] if c in meta.columns]
@@ -605,7 +639,7 @@ def build_table(prices, bench, meta, ohlcv=None):
 
     front = ["Symbol", "Company Name", "Sector", "RS_Rating", "RS_Change",
              "Weighted_Return_%", "Stage", "TT_Score", "TT_Pass", "Stage1_Base", "VCP",
-             "VCP_Setup", "Vol_Breakout", "Liquid", "Avg_Value_Cr", "RS_Line_New_High", "RS_Line_Near_High",
+             "VCP_Setup", "Vol_Breakout", "Liquid", "Avg_Value_Cr", "Market_Cap_Cr", "RS_Line_New_High", "RS_Line_Near_High",
              "RS_Blue_Dot", "RS_Line_Uptrend", "RSI14", "Close", "Pct_From_52W_High",
              "Pct_Above_52W_Low", "SMA50", "SMA150", "SMA200"]
     front = [c for c in front if c in out.columns]
@@ -874,8 +908,10 @@ def main():
     prices = md["Close"]
     bench = get_benchmark()
     print(f"Price data for {prices.shape[1]} stocks, last date: {prices.index[-1].date()}")
+    print("Fetching shares outstanding for market cap (about a minute)...")
+    shares = download_shares(prices.columns)
 
-    result, as_of = build_table(prices, bench, meta, ohlcv=md)
+    result, as_of = build_table(prices, bench, meta, ohlcv=md, shares=shares)
     assert len(result) > 0, "No ratings produced - check price data above"
     n_liq = int(result["Liquid"].sum())
     print(f"\nRS Ratings as of {as_of.date()} (scan size: {len(result)} stocks)")
@@ -897,10 +933,19 @@ def main():
     print(f"Stage 2 {b['pct_stage2']}% | Trend Template {b['pct_tt']}% | RS>=80 {b['pct_rs80']}%")
     print(f"New 52-week highs {b['new_52w_highs']} | new 52-week lows {b['new_52w_lows']}")
 
-    tt = result[result.TT_Pass]
-    top = result[result.TT_Pass & (result.RS_Rating >= PREFERRED_RS)
-                 & result.RS_Line_Near_High & (result.RSI14 > 50)]
-    blue = result[result.RS_Blue_Dot & (result.RS_Rating >= PREFERRED_RS)]
+    # stock lists use the market-cap filter (breadth / sector figures above do not)
+    scan = result
+    n_cap = int(result["Market_Cap_Cr"].notna().sum())
+    if MIN_MARKET_CAP_CR > 0 and n_cap >= 0.5 * len(result):
+        scan = result[result["Market_Cap_Cr"] > MIN_MARKET_CAP_CR]
+        print(f"\nMarket-cap filter: {len(scan)} of {len(result)} stocks above Rs {MIN_MARKET_CAP_CR:.0f} crore "
+              f"({len(result) - n_cap} had no market cap and are excluded)")
+    elif MIN_MARKET_CAP_CR > 0:
+        print(f"\nMarket cap known for only {n_cap} of {len(result)} stocks - filter skipped.")
+    tt = scan[scan.TT_Pass]
+    top = scan[scan.TT_Pass & (scan.RS_Rating >= PREFERRED_RS)
+               & scan.RS_Line_Near_High & (scan.RSI14 > 50)]
+    blue = scan[scan.RS_Blue_Dot & (scan.RS_Rating >= PREFERRED_RS)]
 
     print(f"\n=== Passing all 8 Minervini conditions: {len(tt)} stocks ===")
     print(tt[show].head(40).to_string(index=False))
@@ -910,17 +955,17 @@ def main():
     print(blue[show].head(40).to_string(index=False))
 
     pat_cols = ["Symbol", "RS_Rating", "Stage", "VCP_Contractions", "Vol_Dry_Up", "Pivot",
-                "Pct_To_Pivot", "Breakout_Days_Ago", "Breakout_Vol_x", "Base_Days", "Liquid", "Close"]
-    setups = result[result.VCP_Setup]
-    brk = result[result.Vol_Breakout]
-    s1 = result[result.Stage1_Base].sort_values("Base_Days", ascending=False)
+                "Pct_To_Pivot", "Breakout_Days_Ago", "Breakout_Vol_x", "Base_Days", "Liquid", "Market_Cap_Cr", "Close"]
+    setups = scan[scan.VCP_Setup]
+    brk = scan[scan.Vol_Breakout]
+    s1 = scan[scan.Stage1_Base].sort_values("Base_Days", ascending=False)
     print(f"\n=== VCP SETUPS (tight, volume dried up, within {VCP_NEAR_PIVOT:.0f}% of pivot): {len(setups)} ===")
     print(setups[pat_cols].head(30).to_string(index=False))
     print(f"\n=== VOLUME BREAKOUTS (last {BREAKOUT_RECENT_DAYS} sessions): {len(brk)} ===")
     print(brk[pat_cols].head(30).to_string(index=False))
     print(f"\n=== STAGE 1 BASES FORMING: {len(s1)} ===")
     print(s1[pat_cols].head(30).to_string(index=False))
-    result[result.VCP | result.Vol_Breakout | result.Stage1_Base].to_csv(
+    scan[scan.VCP | scan.Vol_Breakout | scan.Stage1_Base].to_csv(
         "nse500_vcp_breakout_stage1.csv", index=False)
 
     for level in ("Sector", "Industry", "Basic Industry"):

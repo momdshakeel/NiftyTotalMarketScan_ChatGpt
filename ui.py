@@ -159,6 +159,7 @@ SPEC = {
     "Basic Industry": dict(t="Basic industry", type="txt", pri=3, left=True),
     "Liquid": dict(t="Liquid", type="chk", pri=2),
     "Avg_Value_Cr": dict(t="Avg value ₹ cr/day", type="cr", pri=2),
+    "Market_Cap_Cr": dict(t="Mkt cap ₹ cr", type="cr0", pri=2),
     "RS_Rating": dict(t="RS", type="rs", pri=1),
     "RS_Change": dict(t="Chg", type="chg", pri=2),
     "Stage": dict(t="Stage", type="stage", pri=2, left=True),
@@ -202,12 +203,12 @@ SPEC = {
     "Top_Stocks": dict(t="Leaders", type="text", pri=2, left=True),
 }
 COLS_DEFAULT = ["Symbol", "Company Name", "Sector", "RS_Rating", "RS_Change", "Stage", "TT_Score",
-                "Liquid", "Avg_Value_Cr", "RS_Line_New_High", "RS_Blue_Dot", "RSI14", "Close",
+                "Liquid", "Avg_Value_Cr", "Market_Cap_Cr", "RS_Line_New_High", "RS_Blue_Dot", "RSI14", "Close",
                 "Pct_From_52W_High", "Pct_Above_52W_Low", "Weighted_Return_%"]
 COLS_PATTERN = ["Symbol", "RS_Rating", "Stage", "TT_Score", "VCP", "VCP_Contractions", "Vol_Dry_Up",
                 "VCP_Setup", "Pivot", "Pct_To_Pivot", "Close", "Vol_Breakout", "Breakout_Days_Ago",
                 "Breakout_Vol_x", "Vol_x_50d", "Stage1_Base", "Base_Days", "Base_Depth_%", "Liquid",
-                "Avg_Value_Cr", "Sector", "Company Name"]
+                "Avg_Value_Cr", "Market_Cap_Cr", "Sector", "Company Name"]
 COLS_INDUSTRY = ["Rank", "Group", "Industry_Score", "Stocks", "Median_RS", "Avg_RS", "Avg_RS_Change",
                  "Pct_RS80", "Pct_TT_Pass", "Pct_Above_200", "Pct_Stage2", "TT_Pass_Count", "Blue_Dots",
                  "Avg_Weighted_Return_%", "Top_Stocks"]
@@ -288,6 +289,7 @@ function cell(c,r){
   switch(c.type){
     case 'sym':return k+'<a class="sym" target="_blank" rel="noopener" href="https://www.tradingview.com/chart/?symbol=NSE%3A'+encodeURIComponent(v)+'">'+esc(v)+'</a></td>';
     case 'grp':return k+'<b>'+esc(v)+'</b></td>';
+    case 'cr0':return k+(v==null?'<span class="faint">–</span>':Number(v).toLocaleString('en-IN',{maximumFractionDigits:0}))+'</td>';
     case 'cr':return k+(v==null?'<span class="faint">–</span>':Number(v).toLocaleString('en-IN',{maximumFractionDigits:1}))+'</td>';
     case 'txt':return k+'<span class="ell" title="'+esc(v)+'">'+esc(v)+'</span></td>';
     case 'text':return k+(v?'<span class="txt">'+esc(v)+'</span>':'<span class="faint">–</span>')+'</td>';

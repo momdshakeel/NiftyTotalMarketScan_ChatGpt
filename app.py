@@ -43,12 +43,18 @@ def fetch_universe():
     return m.load_universe(local_file=os.path.join(HERE, m.LOCAL_UNIVERSE_FILE))
 
 
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def load_shares(tickers: tuple):
+    """Shares outstanding from Yahoo (they change rarely, so cached for a week)."""
+    return m.download_shares(list(tickers))
+
+
 @st.cache_data(ttl=CACHE_HOURS * 3600, show_spinner=False)
-def compute(meta: pd.DataFrame):
+def compute(meta: pd.DataFrame, shares: pd.Series):
     md = m.download_market_data(meta["Ticker"].tolist())
     prices = md["Close"]
     bench = m.get_benchmark()
-    result, as_of = m.build_table(prices, bench, meta, ohlcv=md)
+    result, as_of = m.build_table(prices, bench, meta, ohlcv=md, shares=shares)
     return result, as_of, datetime.now(IST), prices.shape[1]
 
 
@@ -64,8 +70,15 @@ if meta is None:
 meta = m.attach_classification(meta, m.load_classification(os.path.join(HERE, m.CLASSIFICATION_FILE)))
 
 try:
-    with st.spinner("Downloading ~750 stocks from Yahoo Finance (first load takes 2-3 minutes)..."):
-        result, as_of, fetched_at, n_prices = compute(meta)
+    with st.spinner("Downloading ~750 stocks from Yahoo Finance (first load takes 3-5 minutes)..."):
+        if st.session_state.get("shares_failed"):             # Yahoo throttled us: retry on Refresh only
+            shares = pd.Series(float("nan"), index=meta["Ticker"])
+        else:
+            shares = load_shares(tuple(meta["Ticker"]))
+            if shares.notna().mean() < 0.5:                   # don't keep a bad result for a week
+                load_shares.clear()
+                st.session_state["shares_failed"] = True
+        result, as_of, fetched_at, n_prices = compute(meta, shares)
 except Exception as e:
     st.error(f"Data download failed: {e}")
     if st.button("Retry"):
@@ -81,6 +94,21 @@ with st.sidebar:
     liquid_only = st.toggle("Liquid stocks only", value=False,
                             help=f"Liquid = {LIQ_TEXT}. Applies to the stock lists. Breadth, sector and "
                                  f"industry figures always use liquid stocks.")
+    cap_ok = bool(result["Market_Cap_Cr"].notna().mean() >= 0.5)
+    min_cap = st.number_input("Market cap above (₹ crore)", min_value=0, value=500, step=100,
+                              disabled=not cap_ok,
+                              help="Market cap = shares outstanding × latest close (Yahoo Finance). "
+                                   "Set 0 to switch the filter off. Applies to the stock lists; breadth, "
+                                   "sector and industry figures don't use it.")
+    incl_unknown = st.checkbox("Include unknown market cap", value=False, disabled=not cap_ok,
+                               help="Stocks for which Yahoo has no share count.")
+    if cap_ok:
+        n_cap = int((result["Market_Cap_Cr"] > min_cap).sum())
+        n_unk = int(result["Market_Cap_Cr"].isna().sum())
+        st.caption(f"{n_cap} stocks above ₹{min_cap:,} cr · {n_unk} with unknown market cap")
+    else:
+        st.caption("⚠️ Market cap data unavailable from Yahoo right now, so this filter is off. "
+                   "Click *Refresh data now* to retry.")
     min_rs = st.slider("Minimum RS Rating", 1, 99, 1)
     pref_rs = st.slider("RS for 'Top picks'", 50, 99, m.PREFERRED_RS)
     rsi_min = st.slider("RSI above (Top picks)", 0, 80, 50)
@@ -94,12 +122,18 @@ with st.sidebar:
     if st.button("🔄 Refresh data now", use_container_width=True):
         compute.clear()
         fetch_universe.clear()
+        st.session_state.pop("shares_failed", None)
         st.rerun()
 
 # ---------------- Apply filters ----------------
 df = result
 if liquid_only:
     df = df[df["Liquid"]]
+if cap_ok and min_cap > 0:
+    keep = df["Market_Cap_Cr"] > min_cap
+    if incl_unknown:
+        keep |= df["Market_Cap_Cr"].isna()
+    df = df[keep]
 df = df[df["RS_Rating"] >= min_rs]
 if pick_sector:
     df = df[df["Sector"].isin(pick_sector)]
@@ -233,6 +267,7 @@ with tab_mkt:
 with tab_all:
     show(df.sort_values("RS_Rating", ascending=False), "all",
          "Every rated stock" + (" (liquid only)" if liquid_only else "") +
+         (f" with market cap above ₹{min_cap:,} cr" if cap_ok and min_cap > 0 else "") +
          ". <b>Click any column header to sort.</b>")
 
 with st.expander("Notes & limitations"):
@@ -246,6 +281,8 @@ with st.expander("Notes & limitations"):
         f"- **Sectors** are NSE's 22 sectors, taken from NSE's index list. **Industry** and **Basic industry** come "
         f"from NSE's 4-level classification and appear only when `nse_classification.csv` is present "
         f"(currently: {'loaded' if has_cls else 'not loaded'}).\n"
+        f"- **Market cap** = shares outstanding (Yahoo Finance, cached for a week) × the latest close, in ₹ crore. "
+        f"Yahoo's share counts are occasionally stale or off for small companies, so treat borderline cases with care.\n"
         f"- 52-week high/low use closing prices, not intraday extremes.\n"
         f"- **Stages** use the 150-day SMA (about the 30-week average): Stage 2 = price above a rising average, "
         f"Stage 4 = below a falling one; Stage 1/3 = flat average after a decline/advance.\n"
