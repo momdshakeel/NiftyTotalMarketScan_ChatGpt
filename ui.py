@@ -1,4 +1,4 @@
-"""Look & feel for the NSE 500 scanner: fonts, global CSS, hero, KPI cards and
+"""Look & feel for the Nifty Total Market scanner: fonts, global CSS, hero, KPI cards and
 sortable, responsive HTML tables that follow Streamlit's light/dark theme."""
 import json
 
@@ -84,16 +84,6 @@ section[data-testid="stSidebar"] h2,section[data-testid="stSidebar"] h3{font-siz
 .stButton>button,.stDownloadButton>button{border-radius:10px;border:1px solid var(--line);font-weight:600}
 .stDownloadButton>button{background:var(--soft)}
 div[data-baseweb="select"]>div,.stTextInput input{border-radius:10px!important}
-.meters{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:6px 0 18px}
-.meter{border:1px solid var(--line);background:var(--soft);border-radius:14px;padding:12px 15px 11px}
-.meter .mh{display:flex;justify-content:space-between;align-items:baseline;font-size:.8rem;font-weight:600}
-.meter .mh b{font-size:1.25rem;letter-spacing:-.01em}
-.meter .mt{height:8px;border-radius:99px;background:var(--line);margin-top:8px;overflow:hidden}
-.meter .mf{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
-.meter .mn{font-size:.72rem;opacity:.6;margin-top:6px}
-.advdec{display:flex;height:14px;border-radius:99px;overflow:hidden;margin:6px 0 4px;background:var(--line)}
-.advdec .a{background:#10b981}.advdec .d{background:#ef4444}
-.advlbl{display:flex;justify-content:space-between;font-size:.8rem;font-weight:600;margin-bottom:14px}
 .tabnote{opacity:.72;font-size:.88rem;line-height:1.5;margin:2px 0 12px;max-width:1000px}
 .tabnote b{font-weight:600}
 @media (max-width:640px){.block-container{padding-top:3.4rem!important;padding-left:.8rem!important;padding-right:.8rem!important}
@@ -109,10 +99,10 @@ def inject_css(font: str) -> None:
     st.markdown(css, unsafe_allow_html=True)
 
 
-def hero(title: str, subtitle: str, chips: list, eyebrow: str = "Nifty Total Market · Relative strength") -> None:
+def hero(title: str, subtitle: str, chips: list) -> None:
     chip_html = "".join(f'<span class="chip">{c}</span>' for c in chips)
     st.markdown(
-        f'<div class="hero"><div><div class="eyebrow">{eyebrow}</div>'
+        f'<div class="hero"><div><div class="eyebrow">Nifty Total Market · Relative strength</div>'
         f'<div class="title">{title}</div><div class="sub">{subtitle}</div></div>'
         f'<div class="chips">{chip_html}</div></div>', unsafe_allow_html=True)
 
@@ -123,25 +113,6 @@ def kpis(items: list) -> None:
         f'<div class="kpi" style="--kc:{c}"><div class="l">{l}</div><div class="v">{v}</div>'
         f'<div class="s">{s}</div></div>' for l, v, s, c in items)
     st.markdown(f'<div class="kpis">{cards}</div>', unsafe_allow_html=True)
-
-
-def meters(items: list) -> None:
-    """items: (label, percent 0-100, small note)"""
-    cards = "".join(
-        f'<div class="meter"><div class="mh"><span>{l}</span><b>{p:.0f}%</b></div>'
-        f'<div class="mt"><div class="mf" style="width:{max(0, min(100, p))}%"></div></div>'
-        f'<div class="mn">{n}</div></div>' for l, p, n in items)
-    st.markdown(f'<div class="meters">{cards}</div>', unsafe_allow_html=True)
-
-
-def adv_dec(adv: int, dec: int, unch: int) -> None:
-    total = max(adv + dec + unch, 1)
-    st.markdown(
-        f'<div class="advdec"><div class="a" style="width:{adv / total * 100:.1f}%"></div>'
-        f'<div class="d" style="width:{dec / total * 100:.1f}%"></div></div>'
-        f'<div class="advlbl"><span style="color:#10b981">▲ {adv} advancing</span>'
-        f'<span style="opacity:.6">{unch} unchanged</span>'
-        f'<span style="color:#ef4444">{dec} declining ▼</span></div>', unsafe_allow_html=True)
 
 
 def note(text: str) -> None:
@@ -155,11 +126,10 @@ SPEC = {
     "Symbol": dict(t="Symbol", type="sym", pri=1, left=True),
     "Company Name": dict(t="Company", type="txt", pri=3, left=True),
     "Sector": dict(t="Sector", type="txt", pri=3, left=True),
-    "Industry": dict(t="Industry", type="txt", pri=3, left=True),
     "Basic Industry": dict(t="Basic industry", type="txt", pri=3, left=True),
     "Liquid": dict(t="Liquid", type="chk", pri=2),
-    "Avg_Value_Cr": dict(t="Avg value ₹ cr/day", type="cr", pri=2),
-    "Market_Cap_Cr": dict(t="Mkt cap ₹ cr", type="cr0", pri=2),
+    "Avg_Traded_Value_20D_Cr": dict(t="20D ADTV ₹Cr", type="n1", pri=2),
+    "Market_Cap_Cr": dict(t="Mkt cap ₹Cr", type="n1", pri=2),
     "RS_Rating": dict(t="RS", type="rs", pri=1),
     "RS_Change": dict(t="Chg", type="chg", pri=2),
     "Stage": dict(t="Stage", type="stage", pri=2, left=True),
@@ -187,9 +157,6 @@ SPEC = {
     "Base_Depth_%": dict(t="Base depth", type="pct", pri=3),
     # industry table
     "Rank": dict(t="#", type="n0", pri=1),
-    "Group": dict(t="Group", type="grp", pri=1, left=True),
-    "Pct_Above_200": dict(t="Above 200 SMA", type="pct0", pri=3),
-    "Pct_Stage2": dict(t="Stage 2", type="pct0", pri=3),
     "Industry_Score": dict(t="Strength", type="bar", pri=1),
     "Stocks": dict(t="Stocks", type="n0", pri=2),
     "Median_RS": dict(t="Median RS", type="n0", pri=2),
@@ -202,16 +169,17 @@ SPEC = {
     "Avg_Weighted_Return_%": dict(t="Avg return", type="spct", pri=3),
     "Top_Stocks": dict(t="Leaders", type="text", pri=2, left=True),
 }
-COLS_DEFAULT = ["Symbol", "Company Name", "Sector", "RS_Rating", "RS_Change", "Stage", "TT_Score",
-                "Liquid", "Avg_Value_Cr", "Market_Cap_Cr", "RS_Line_New_High", "RS_Blue_Dot", "RSI14", "Close",
-                "Pct_From_52W_High", "Pct_Above_52W_Low", "Weighted_Return_%"]
-COLS_PATTERN = ["Symbol", "RS_Rating", "Stage", "TT_Score", "VCP", "VCP_Contractions", "Vol_Dry_Up",
+COLS_DEFAULT = ["Symbol", "Company Name", "Sector", "Basic Industry", "Liquid",
+                "Avg_Traded_Value_20D_Cr", "Market_Cap_Cr", "RS_Rating", "RS_Change", "Stage", "TT_Score",
+                "RS_Line_New_High", "RS_Blue_Dot", "RSI14", "Close", "Pct_From_52W_High",
+                "Pct_Above_52W_Low", "Weighted_Return_%"]
+COLS_PATTERN = ["Symbol", "RS_Rating", "Liquid", "Avg_Traded_Value_20D_Cr", "Market_Cap_Cr", "Stage", "TT_Score", "VCP", "VCP_Contractions", "Vol_Dry_Up",
                 "VCP_Setup", "Pivot", "Pct_To_Pivot", "Close", "Vol_Breakout", "Breakout_Days_Ago",
-                "Breakout_Vol_x", "Vol_x_50d", "Stage1_Base", "Base_Days", "Base_Depth_%", "Liquid",
-                "Avg_Value_Cr", "Market_Cap_Cr", "Sector", "Company Name"]
-COLS_INDUSTRY = ["Rank", "Group", "Industry_Score", "Stocks", "Median_RS", "Avg_RS", "Avg_RS_Change",
-                 "Pct_RS80", "Pct_TT_Pass", "Pct_Above_200", "Pct_Stage2", "TT_Pass_Count", "Blue_Dots",
-                 "Avg_Weighted_Return_%", "Top_Stocks"]
+                "Breakout_Vol_x", "Vol_x_50d", "Stage1_Base", "Base_Days", "Base_Depth_%", "Basic Industry",
+                "Company Name"]
+COLS_INDUSTRY = ["Rank", "Basic Industry", "Industry_Score", "Stocks", "Median_RS", "Avg_RS", "Avg_RS_Change",
+                 "Pct_RS80", "Pct_TT_Pass", "TT_Pass_Count", "Blue_Dots", "Avg_Weighted_Return_%",
+                 "Top_Stocks"]
 
 # ---------------------------------------------------------------- table iframe
 _TABLE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
@@ -288,9 +256,6 @@ function cell(c,r){
   const v=r[c.k],k='<td class="'+pc(c)+'">';
   switch(c.type){
     case 'sym':return k+'<a class="sym" target="_blank" rel="noopener" href="https://www.tradingview.com/chart/?symbol=NSE%3A'+encodeURIComponent(v)+'">'+esc(v)+'</a></td>';
-    case 'grp':return k+'<b>'+esc(v)+'</b></td>';
-    case 'cr0':return k+(v==null?'<span class="faint">–</span>':Number(v).toLocaleString('en-IN',{maximumFractionDigits:0}))+'</td>';
-    case 'cr':return k+(v==null?'<span class="faint">–</span>':Number(v).toLocaleString('en-IN',{maximumFractionDigits:1}))+'</td>';
     case 'txt':return k+'<span class="ell" title="'+esc(v)+'">'+esc(v)+'</span></td>';
     case 'text':return k+(v?'<span class="txt">'+esc(v)+'</span>':'<span class="faint">–</span>')+'</td>';
     case 'rs':{if(v==null)return k+'–</td>';const q=v>=90?'c1':v>=80?'c2':v>=70?'c3':v>=50?'c4':'c5';return k+'<span class="badge '+q+'">'+v+'</span></td>';}
@@ -338,12 +303,9 @@ sync();setInterval(sync,1000);draw();
 
 
 def table(df, keys, sort, font="Inter", density="Comfortable",
-          empty="No stocks match the current filters.", titles=None):
+          empty="No stocks match the current filters."):
     """Render a sortable, theme-aware table. `sort` = (column key, -1 desc | 1 asc)."""
     cols = [dict(SPEC[k], k=k) for k in keys if k in df.columns and k in SPEC]
-    for c in cols:
-        if titles and c["k"] in titles:
-            c["t"] = titles[c["k"]]
     data = json.loads(df[[c["k"] for c in cols]].to_json(orient="records")) if len(df) else []
     rowh = 31 if density == "Compact" else 41
     height = (120 if not data else min(len(data) * rowh + 46, 640)) + 4
