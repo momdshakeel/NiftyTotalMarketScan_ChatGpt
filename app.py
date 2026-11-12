@@ -89,6 +89,79 @@ def compute(meta: pd.DataFrame):
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_delivery_percentages(symbols: tuple[str, ...], as_of: str) -> pd.DataFrame:
+    """Fetch NSE full bhavcopy delivery data and aggregate last 1, 5 and 21 sessions."""
+    import concurrent.futures
+    from datetime import date, timedelta
+
+    end = date.fromisoformat(as_of)
+    dates = []
+    for offset in range(42):
+        day = end - timedelta(days=offset)
+        if day.weekday() < 5:
+            dates.append(day)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+               "Accept": "text/csv,*/*"}
+
+    def fetch_day(day):
+        filename = f"sec_bhavdata_full_{day:%d%m%Y}.csv"
+        for host in ("https://nsearchives.nseindia.com", "https://archives.nseindia.com"):
+            try:
+                response = requests.get(f"{host}/products/content/{filename}",
+                                         headers=headers, timeout=(4, 8))
+                if response.ok and "SYMBOL" in response.text[:500].upper():
+                    raw = pd.read_csv(io.StringIO(response.text))
+                    raw.columns = [str(column).strip().upper() for column in raw.columns]
+                    required = {"SYMBOL", "SERIES", "TOTTRDQTY", "DELIV_QTY"}
+                    if required.issubset(raw.columns):
+                        return day, raw
+            except Exception:
+                continue
+        return day, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        daily = [raw for _, raw in sorted(executor.map(fetch_day, dates), reverse=True)
+                 if raw is not None]
+    if not daily:
+        return pd.DataFrame(columns=["Symbol", "Delivery_1D_%", "Delivery_1W_%", "Delivery_1M_%"])
+
+    symbol_set = {str(symbol).strip().upper() for symbol in symbols}
+    history = []
+    for raw in daily:
+        raw["SYMBOL"] = raw["SYMBOL"].astype("string").str.strip().str.upper()
+        raw["SERIES"] = raw["SERIES"].astype("string").str.strip().str.upper()
+        raw = raw[raw["SYMBOL"].isin(symbol_set) & raw["SERIES"].eq("EQ")].copy()
+        if raw.empty:
+            continue
+        raw["TOTTRDQTY"] = pd.to_numeric(raw["TOTTRDQTY"], errors="coerce")
+        raw["DELIV_QTY"] = pd.to_numeric(raw["DELIV_QTY"], errors="coerce")
+        if "DELIV_PER" in raw:
+            raw["DELIV_PER"] = pd.to_numeric(raw["DELIV_PER"], errors="coerce")
+        else:
+            raw["DELIV_PER"] = (raw["DELIV_QTY"] / raw["TOTTRDQTY"] * 100).where(raw["TOTTRDQTY"] > 0)
+        history.append(raw.groupby("SYMBOL", as_index=False).agg(
+            traded=("TOTTRDQTY", "sum"), delivered=("DELIV_QTY", "sum"),
+            daily_pct=("DELIV_PER", "mean"),
+        ))
+
+    if not history:
+        return pd.DataFrame(columns=["Symbol", "Delivery_1D_%", "Delivery_1W_%", "Delivery_1M_%"])
+    history = history[:21]
+    daily_latest = history[0].set_index("SYMBOL")
+    out = pd.DataFrame({"Symbol": sorted(symbol_set)})
+    out["Delivery_1D_%"] = out["Symbol"].map(daily_latest["daily_pct"])
+    for label, sessions in (("Delivery_1W_%", 5), ("Delivery_1M_%", 21)):
+        if len(history) < sessions:
+            percentage = pd.Series(dtype=float)
+        else:
+            period = pd.concat(history[:sessions], ignore_index=True).groupby("SYMBOL").sum(numeric_only=True)
+            percentage = (period["delivered"] / period["traded"] * 100).where(period["traded"] > 0)
+        out[label] = out["Symbol"].map(percentage).round(1)
+    out["Delivery_1D_%"] = out["Delivery_1D_%"].round(1)
+    return out
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def fetch_market_caps(tickers: tuple[str, ...]) -> dict[str, float]:
     """Fetch Yahoo Finance market caps in ₹ crore; missing values are omitted."""
     def fetch_one(ticker: str):
@@ -122,6 +195,18 @@ except Exception as e:
     if st.button("Retry"):
         st.rerun()
     st.stop()
+
+try:
+    with st.spinner("Loading NSE delivery data (first load may take a little longer)…"):
+        delivery = fetch_delivery_percentages(
+            tuple(result["Symbol"].dropna().astype(str).unique()), str(as_of.date()))
+    result = result.merge(delivery, on="Symbol", how="left")
+    if delivery.empty or delivery["Delivery_1D_%"].notna().sum() == 0:
+        st.caption("NSE delivery data is temporarily unavailable; delivery columns will be blank. Price and RS scans are unaffected.")
+except Exception:
+    for column in ("Delivery_1D_%", "Delivery_1W_%", "Delivery_1M_%"):
+        result[column] = np.nan
+    st.caption("NSE delivery percentages are temporarily unavailable; price and RS scans are unaffected.")
 
 # ---------------- Sidebar filters ----------------
 with st.sidebar:
@@ -201,6 +286,7 @@ ui.kpis([
     ("Stage 1 bases", len(s1), "early watch-list", "#3b82f6"),
     ("RS blue dot", len(blue), "RS line leads price", "#ec4899"),
 ])
+st.caption("Delivery % uses NSE deliverable quantity ÷ traded quantity. 1W and 1M are volume-weighted over the latest 5 and 21 sessions.")
 
 
 def show(frame, name, text, keys=None, sort=("RS_Rating", -1)):

@@ -14,6 +14,7 @@ A Streamlit scanner for Nifty Total Market constituents. The official index comb
 - Search, industry filters, downloadable CSVs, cached data and manual refresh.
 - Per-table **Columns** menu with show/hide checkboxes, Select all and Clear all controls; CSV downloads follow the visible columns.
 - A **Search symbol / company** box above each results table filters by ticker or company name instantly as you type.
+- Daily delivery percentage from NSE, plus 5-session weekly and 21-session monthly delivery percentages weighted by traded volume. These fields appear in stock result tables and can be toggled in **Columns**; values remain blank when NSE data is unavailable.
 
 ## Run locally
 
