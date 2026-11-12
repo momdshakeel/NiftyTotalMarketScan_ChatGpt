@@ -205,9 +205,34 @@ ui.kpis([
 
 def show(frame, name, text, keys=None, sort=("RS_Rating", -1)):
     ui.note(text)
-    ui.table(frame, keys or ui.COLS_DEFAULT, sort, font, density)
+    available = [key for key in (keys or ui.COLS_DEFAULT)
+                 if key in frame.columns and key in ui.SPEC]
+    state_keys = {key: f"show_col_{name}_{key}" for key in available}
+    with st.popover("Columns"):
+        st.caption("Choose which columns appear in this table.")
+        select_col, clear_col = st.columns(2)
+        if select_col.button("Select all", key=f"select_all_cols_{name}", use_container_width=True):
+            for state_key in state_keys.values():
+                st.session_state[state_key] = True
+        if clear_col.button("Clear all", key=f"clear_all_cols_{name}", use_container_width=True):
+            for state_key in state_keys.values():
+                st.session_state[state_key] = False
+        check_cols = st.columns(3)
+        for index, key in enumerate(available):
+            state_key = state_keys[key]
+            if state_key not in st.session_state:
+                st.session_state[state_key] = True
+            check_cols[index % 3].checkbox(ui.SPEC[key]["t"], key=state_key)
+
+    visible = [key for key in available if st.session_state.get(state_keys[key], True)]
+    if visible:
+        active_sort = sort if sort[0] in visible else (visible[0], 1)
+        ui.table(frame, visible, active_sort, font, density)
+    else:
+        st.info("No columns selected. Open Columns and select at least one.")
     if not frame.empty:
-        st.download_button("⬇️ Download CSV", frame.to_csv(index=False).encode("utf-8"),
+        export_frame = frame[visible] if visible else frame[available]
+        st.download_button("⬇️ Download CSV", export_frame.to_csv(index=False).encode("utf-8"),
                            file_name=f"nifty_total_market_{name}_{as_of.date()}.csv", mime="text/csv",
                            key=f"dl_{name}")
 
@@ -223,10 +248,9 @@ def show_industries():
     if ind.empty:
         st.info("No industries meet the minimum size.")
         return
-    ui.table(ind, ui.COLS_INDUSTRY, ("Rank", 1), font, density)
-    st.download_button("⬇️ Download CSV", ind.to_csv(index=False).encode("utf-8"),
-                       file_name=f"nifty_total_market_basic_industry_strength_{as_of.date()}.csv", mime="text/csv",
-                       key="dl_industry_table")
+    show(ind, "basic_industry_strength",
+         "Basic-industry strength rankings use liquid stocks. Choose Columns to customize the table.",
+         ui.COLS_INDUSTRY, ("Rank", 1))
     st.markdown("#### Stocks in an industry")
     pick = st.selectbox("Choose a basic industry (listed by strength)", ind["Basic Industry"].tolist())
     members = liquid_result[liquid_result["Basic Industry"] == pick].sort_values("RS_Rating", ascending=False)

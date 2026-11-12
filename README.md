@@ -12,6 +12,7 @@ A Streamlit scanner for Nifty Total Market constituents. The official index comb
 - Stock detail candlesticks with EMA 10/21, SMA 50/200, volume with its 50-session average, and a relative-strength panel against Nifty 500.
 - Historical consolidation bases are drawn as shaded rectangles. A newest-first 12-month base-history table reports start, length, depth, pivot, breakout, breakout volume and outcome; pivot and 52-week-high levels can be toggled.
 - Search, industry filters, downloadable CSVs, cached data and manual refresh.
+- Per-table **Columns** menu with show/hide checkboxes, Select all and Clear all controls; CSV downloads follow the visible columns.
 
 ## Run locally
 
