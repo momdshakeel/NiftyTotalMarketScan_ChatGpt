@@ -241,10 +241,14 @@ box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent)}
 .bar b{min-width:24px;text-align:right}
 .txt{color:color-mix(in srgb,var(--fg) 85%,var(--bg))}
 .empty{text-align:center;padding:36px 12px;opacity:.6}
+.searchbar{position:sticky;top:0;z-index:5;padding:9px 12px;background:var(--bg);border-bottom:1px solid var(--line)}
+.searchbar input{width:min(100%,360px);height:34px;padding:0 11px;border:1px solid var(--line);border-radius:8px;
+background:var(--bg);color:var(--fg);font:inherit;outline:none}
+.searchbar input:focus{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 18%,transparent)}
 @media (max-width:760px){.p3{display:none}}
 @media (max-width:520px){.p2{display:none}td,th{padding:0 9px}}
 </style></head><body>
-<div class="wrap"><table><thead id="h"></thead><tbody id="b"></tbody></table></div>
+<div class="wrap"><div class="searchbar"><input id="q" type="search" aria-label="Search symbol or company" placeholder="Search symbol / company…" autocomplete="off"></div><table><thead id="h"></thead><tbody id="b"></tbody></table></div>
 <script>
 const P=__PAYLOAD__;
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -279,7 +283,8 @@ function cell(c,r){
   return k+esc(v)+'</td>';
 }
 function draw(){
-  const rows=P.rows.slice();
+  const query=document.getElementById('q').value.trim().toLocaleLowerCase();
+  const rows=P.rows.filter(r=>!query||String(r.Symbol||'').toLocaleLowerCase().includes(query)||String(r['Company Name']||'').toLocaleLowerCase().includes(query));
   rows.sort((a,b)=>{let x=a[sk],y=b[sk];
     if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;
     if(typeof x==='string')return sd*x.localeCompare(y);
@@ -290,6 +295,7 @@ function draw(){
   document.querySelectorAll('th').forEach(th=>th.onclick=()=>{const k=th.dataset.k;
     if(k===sk)sd=-sd;else{sk=k;sd=P.cols.find(c=>c.k===k).left?1:-1;}draw();});
 }
+document.getElementById('q').addEventListener('input',draw);
 // follow the Streamlit theme (light / dark / custom) live
 function sync(){
   let bg,fg;
@@ -306,9 +312,11 @@ def table(df, keys, sort, font="Inter", density="Comfortable",
           empty="No stocks match the current filters."):
     """Render a sortable, theme-aware table. `sort` = (column key, -1 desc | 1 asc)."""
     cols = [dict(SPEC[k], k=k) for k in keys if k in df.columns and k in SPEC]
-    data = json.loads(df[[c["k"] for c in cols]].to_json(orient="records")) if len(df) else []
+    data_keys = list(dict.fromkeys([c["k"] for c in cols] +
+                                   [k for k in ("Symbol", "Company Name") if k in df.columns]))
+    data = json.loads(df[data_keys].to_json(orient="records")) if len(df) else []
     rowh = 31 if density == "Compact" else 41
-    height = (120 if not data else min(len(data) * rowh + 46, 640)) + 4
+    height = (168 if not data else min(len(data) * rowh + 94, 688)) + 4
     payload = json.dumps({"cols": cols, "rows": data, "sort": list(sort), "empty": empty}).replace("</", "<\\/")
     html = (_TABLE_HTML
             .replace("__IMPORT__", f"@import url('{font_url(font)}');" if font_url(font) else "")

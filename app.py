@@ -205,21 +205,8 @@ ui.kpis([
 
 def show(frame, name, text, keys=None, sort=("RS_Rating", -1)):
     ui.note(text)
-    query = st.text_input(
-        "Search symbol / company",
-        placeholder="Type a ticker or company name",
-        key=f"table_search_{name}",
-    ).strip()
-    searchable = [column for column in ("Symbol", "Company Name") if column in frame.columns]
-    displayed = frame
-    if query and searchable:
-        matches = pd.Series(False, index=frame.index)
-        for column in searchable:
-            matches |= frame[column].astype("string").str.contains(query, case=False, na=False, regex=False)
-        displayed = frame[matches]
-
     available = [key for key in (keys or ui.COLS_DEFAULT)
-                 if key in displayed.columns and key in ui.SPEC]
+                 if key in frame.columns and key in ui.SPEC]
     state_keys = {key: f"show_col_{name}_{key}" for key in available}
     with st.popover("Columns"):
         st.caption("Choose which columns appear in this table.")
@@ -240,13 +227,11 @@ def show(frame, name, text, keys=None, sort=("RS_Rating", -1)):
     visible = [key for key in available if st.session_state.get(state_keys[key], True)]
     if visible:
         active_sort = sort if sort[0] in visible else (visible[0], 1)
-        ui.table(displayed, visible, active_sort, font, density)
-        if query and displayed.empty:
-            st.caption("No matching symbol or company found.")
+        ui.table(frame, visible, active_sort, font, density)
     else:
         st.info("No columns selected. Open Columns and select at least one.")
-    if not displayed.empty:
-        export_frame = displayed[visible] if visible else displayed[available]
+    if not frame.empty:
+        export_frame = frame[visible] if visible else frame[available]
         st.download_button("⬇️ Download CSV", export_frame.to_csv(index=False).encode("utf-8"),
                            file_name=f"nifty_total_market_{name}_{as_of.date()}.csv", mime="text/csv",
                            key=f"dl_{name}")

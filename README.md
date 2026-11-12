@@ -13,7 +13,7 @@ A Streamlit scanner for Nifty Total Market constituents. The official index comb
 - Historical consolidation bases are drawn as shaded rectangles. A newest-first 12-month base-history table reports start, length, depth, pivot, breakout, breakout volume and outcome; pivot and 52-week-high levels can be toggled.
 - Search, industry filters, downloadable CSVs, cached data and manual refresh.
 - Per-table **Columns** menu with show/hide checkboxes, Select all and Clear all controls; CSV downloads follow the visible columns.
-- A **Search symbol / company** box above each results table filters by ticker or company name; CSV downloads follow the matching rows.
+- A **Search symbol / company** box above each results table filters by ticker or company name instantly as you type.
 
 ## Run locally
 
